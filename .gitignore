@@ -84,6 +84,12 @@ VPPipeline/.vs/
 VPPipeline/Plugins/**/Intermediate/
 VPPipeline/Plugins/**/Binaries/
 
+# Third-party UE plugins (large, install separately)
+VPPipeline/Plugins/VRM4U-master/
+
+# Claude Code worktree
+.claude/
+
 # Python
 __pycache__/
 *.py[cod]

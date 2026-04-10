@@ -129,3 +129,32 @@
 - 빌드 이슈 해결: `Sockets/Public/IPAddress.h` include 경로 오류 수정
 - UE 에디터 컴파일 성공
 - 검증 완료: Python sender.py -> UDP -> UVPUDPReceiver 패킷 수신 정상 (BS=52, Pose=33)
+
+## 2026.04.10 (Phase 3)
+### Phase 3: 애니메이션 리타겟팅 C++ 구현
+- VPTrackingData.h: `FVPBlendshapeMapping` DataTable row 구조체 추가 (ARKitName, MorphTargetName, Scale)
+- VPAnimInstance.h 확장:
+  - `BlendshapeMappingTable` (UDataTable*): ARKit -> Morph Target 이름 리매핑 (DataTable 기반, 런타임 교체 가능)
+  - `FaceBlendshapes` (TMap<FName, float>): 리매핑 후 블렌드쉐이프 값 (Blueprint/AnimGraph 접근용)
+  - `PoseBoneTransforms` (TArray<FTransform>): MediaPipe 33 랜드마크 -> UE 좌표계 변환
+  - `PosePositionScale`: 정규화 좌표(0~1) -> UE 단위 스케일 팩터
+  - `bAutoFindReceiver`: 동일 Actor의 VPUDPReceiver 자동 연결
+  - `ApplyTrackingData()`: 블렌드쉐이프 + 포즈 통합 적용 함수
+  - `UpdatePoseBoneTransforms()`: 포즈 -> 본 트랜스폼 변환 함수
+- VPAnimInstance.cpp 구현:
+  - `NativeInitializeAnimation()`: VPUDPReceiver 자동 탐색/캐싱
+  - `NativeUpdateAnimation()`: 매 프레임 수신기에서 데이터 풀링 + 블렌드쉐이프/포즈 적용
+  - `CacheMappingTable()`: DataTable 첫 사용 시 캐싱 (매 프레임 조회 방지)
+  - `ApplyBlendshapesToMorphTargets()`: DataTable 리매핑 적용, 매핑 없으면 ARKit 이름 직접 사용
+  - `UpdatePoseBoneTransforms()`: MediaPipe (X우,Y하,Z전방) -> UE (X전방,Y우,Z상) 좌표 변환
+- UE 에디터 컴파일 성공 (오류 없음)
+- VRoid 아바타 Morph Target 매핑: ARKit 이름과 VRoid 이름 불일치 확인
+  - VRoid 명명 체계: Fcl_EYE_Close_L, Fcl_MTH_A 등 (ARKit: eyeBlinkLeft, jawOpen 등)
+  - VRoidBlendshapeMapping.csv 생성 (21개 ARKit -> VRoid 매핑)
+  - UE DataTable 임포트 후 VPAnimInstance에 할당
+- 검증 완료 (test_phase3.py):
+  - [PASS] 패킷 포맷: 620B, Magic VPFR, BS=52, Pose=33
+  - [PASS] UDP 수신: ~60Hz, 351프레임 전송/수신 정상
+  - [PASS] AnimInstance 자동 연결: VPUDPReceiver auto-connect 로그 확인
+  - [PASS] DataTable 리매핑: ARKit -> VRoid Morph Target 변환 정상
+  - [PASS] 시각적 검증: 눈 깜빡임(eyeBlink -> Fcl_EYE_Close) + 입 벌림(mouthSmile -> Fcl_MTH_Joy/Fun) 확인

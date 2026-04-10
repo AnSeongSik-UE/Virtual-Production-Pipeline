@@ -1,7 +1,30 @@
 #pragma once
 
 #include "CoreMinimal.h"
+#include "Engine/DataTable.h"
 #include "VPTrackingData.generated.h"
+
+/**
+ * DataTable row: ARKit blendshape name -> avatar Morph Target name
+ * Use this to remap ARKit names to your avatar's morph target naming convention.
+ */
+USTRUCT(BlueprintType)
+struct VPTRACKERRECEIVER_API FVPBlendshapeMapping : public FTableRowBase
+{
+	GENERATED_BODY()
+
+	/** ARKit blendshape name (e.g. "eyeBlinkLeft") */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "VP Mapping")
+	FName ARKitName;
+
+	/** Target morph target name on the avatar (e.g. "EyeBlink_L") */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "VP Mapping")
+	FName MorphTargetName;
+
+	/** Weight scale factor (default 1.0) */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "VP Mapping", meta = (ClampMin = "0.0", ClampMax = "3.0"))
+	float Scale = 1.0f;
+};
 
 /**
  * ARKit 52 blendshape weights from MediaPipe FaceLandmarker
