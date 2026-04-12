@@ -82,14 +82,18 @@ public:
 	float YawSign = -1.0f;
 
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "VP Head", meta = (ClampMin = "-1.0", ClampMax = "1.0"))
-	float PitchSign = -1.0f;
+	float PitchSign = 1.0f;
 
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "VP Head", meta = (ClampMin = "-1.0", ClampMax = "1.0"))
-	float RollSign = 1.0f;
+	float RollSign = -1.0f;
 
 	/** Smoothing factor for head rotation (0 = no smoothing, 1 = max smoothing) */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "VP Head", meta = (ClampMin = "0.0", ClampMax = "0.95"))
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "VP Head", meta = (ClampMin = "0.0", ClampMax = "0.99"))
 	float HeadRotationSmoothing = 0.5f;
+
+	/** Max rotation change per frame (degrees) - prevents wild jumps from noisy landmarks */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "VP Head", meta = (ClampMin = "0.5", ClampMax = "20.0"))
+	float HeadMaxDeltaPerFrame = 5.0f;
 
 	/** Current head rotation (readable from Blueprint / AnimGraph) */
 	UPROPERTY(BlueprintReadOnly, Category = "VP Head")
@@ -126,4 +130,5 @@ private:
 
 	/** Previous head rotation for smoothing */
 	FRotator SmoothedHeadRotation = FRotator::ZeroRotator;
+
 };

@@ -165,24 +165,41 @@ void UVPAnimInstance::UpdateHeadRotation()
 		return;
 	}
 
-	// Yaw: nose horizontal offset from shoulder center, normalized by shoulder width
-	const float NoseOffsetX = (Nose.X - ShoulderMid.X) / ShoulderWidth;
+	// Roll: shoulder tilt angle (calculated first for compensation)
+	const float ShoulderDeltaY = RShoulder.Y - LShoulder.Y;
+	const float RollRad = FMath::Atan2(ShoulderDeltaY, ShoulderWidth);
+	const float Roll = FMath::Clamp(FMath::RadiansToDegrees(RollRad) * -1.0f * HeadRotationScale, -25.0f, 25.0f);
+
+	// Nose offset from shoulder center (normalized by shoulder width)
+	const float RawOffsetX = (Nose.X - ShoulderMid.X) / ShoulderWidth;
+	const float RawOffsetY = (Nose.Y - ShoulderMid.Y) / ShoulderWidth;
+
+	// Roll compensation: rotate nose offset back by -Roll to remove tilt contamination
+	const float CosR = FMath::Cos(-RollRad);
+	const float SinR = FMath::Sin(-RollRad);
+	const float NoseOffsetX = CosR * RawOffsetX - SinR * RawOffsetY;
+	const float NoseOffsetY = SinR * RawOffsetX + CosR * RawOffsetY;
+
+	// Yaw: compensated horizontal offset
 	const float Yaw = FMath::Clamp(NoseOffsetX * 60.0f * HeadRotationScale, -45.0f, 45.0f);
 
-	// Pitch: nose vertical offset from shoulder center (lower = looking down)
-	const float NoseOffsetY = (Nose.Y - ShoulderMid.Y) / ShoulderWidth;
+	// Pitch: compensated vertical offset
 	const float NeutralOffset = -0.8f; // neutral head position is above shoulders
 	const float Pitch = FMath::Clamp((NoseOffsetY - NeutralOffset) * 60.0f * HeadRotationScale, -30.0f, 30.0f);
-
-	// Roll: shoulder tilt angle
-	const float ShoulderDeltaY = RShoulder.Y - LShoulder.Y;
-	const float Roll = FMath::Clamp(ShoulderDeltaY / ShoulderWidth * -40.0f * HeadRotationScale, -25.0f, 25.0f);
 
 	// VRoid bone axis: Roll->Pitch, Yaw, Pitch->Roll with sign multipliers
 	const FRotator TargetRotation(Roll * RollSign, Yaw * YawSign, Pitch * PitchSign);
 
 	// Smooth
-	SmoothedHeadRotation = FMath::Lerp(TargetRotation, SmoothedHeadRotation, HeadRotationSmoothing);
+	FRotator NewSmoothed = FMath::Lerp(TargetRotation, SmoothedHeadRotation, HeadRotationSmoothing);
+
+	// Rate limit: clamp max change per frame to prevent wild jumps
+	FRotator Delta = (NewSmoothed - SmoothedHeadRotation).GetNormalized();
+	Delta.Pitch = FMath::Clamp(Delta.Pitch, -HeadMaxDeltaPerFrame, HeadMaxDeltaPerFrame);
+	Delta.Yaw = FMath::Clamp(Delta.Yaw, -HeadMaxDeltaPerFrame, HeadMaxDeltaPerFrame);
+	Delta.Roll = FMath::Clamp(Delta.Roll, -HeadMaxDeltaPerFrame, HeadMaxDeltaPerFrame);
+
+	SmoothedHeadRotation = (SmoothedHeadRotation + Delta).GetNormalized();
 	HeadRotation = SmoothedHeadRotation;
 
 	// HeadRotation is stored as a UPROPERTY for use in AnimBP (Transform Modify Bone node)

@@ -193,3 +193,51 @@
   - [PASS] UDP port 7000: Available
   - [PASS] OBS WebSocket: Connected (OBS v32.1.1, WebSocket v5.7.3)
   - [PASS] MediaPipe models: All models found
+
+## 2026.04.12 (Phase 5)
+### Phase 5: 헤드 트래킹 + 크로마키 + UnrealMCP 포트
+- VPAnimInstance 헤드 트래킹 구현:
+  - MediaPipe PoseLandmark 0(코), 11(좌어깨), 12(우어깨)로 Yaw/Pitch/Roll 계산
+  - 어깨 폭 기준 정규화 → 회전 각도 변환 (Yaw 60, Pitch 60, Roll 40 계수)
+  - VRoid J_Bip_C_Head 본 축 매핑: FRotator(Roll, Yaw, Pitch) 축 스왑
+  - 축 부호 멀티플라이어 추가 (YawSign=-1, PitchSign=-1, RollSign=1) — 에디터에서 리빌드 없이 조정 가능
+  - HeadRotationSmoothing: FMath::Lerp 기반 스무딩 (사용자 0.95 설정으로 떨림 해소)
+  - HeadRotation UPROPERTY → AnimBP Transform (Modify) Bone 노드에서 사용
+  - 직접 본 조작(GetBoneTransformByName 등) 시도 → UE 5.7 API 제한으로 AnimBP 방식 채택
+- AnimBP 설정:
+  - Transform (Modify) Bone 노드: J_Bip_C_Head 본 대상
+  - HeadRotation 변수 연결 (AnimInstance에서 매 프레임 갱신)
+- 크로마키 배경:
+  - 아바타 뒤 초록 플레인 배치 + M_GreenScreen 머티리얼
+  - OBS Chroma Key 필터로 배경 제거 확인
+- UnrealMCP 플러그인 UE 5.7 포트:
+  - tools/unreal-mcp → VPPipeline/Plugins/UnrealMCP 복사
+  - BufferSize → MCPBufferSize 이름 충돌 해결
+  - ANY_PACKAGE(deprecated) → nullptr 교체 (9건, 2파일)
+  - 빌드 성공, MCP 서버 port 55557 정상 기동 확인
+- 디버그 도구:
+  - debug_all_bs.py: 표정별 블렌드쉐이프 활성값 실시간 확인
+
+### 헤드 트래킹 추가 수정
+- 극단적 자세(깊이 숙이기)에서 랜드마크 노이즈로 머리 부들부들 현상 발생
+  - HeadMaxDeltaPerFrame 추가 (프레임당 최대 회전 변화량 제한, 기본 5.0도) → 해결
+- 기울이기(Roll) 시 Yaw 오염 문제 발생
+  - 어깨 Roll 기반 보상 시도 → 실패 (어깨 Roll != 머리 Roll, 머리만 기울일 때 보정 안 됨)
+  - 근본 해결은 FaceLandmarker의 facial_transformation_matrixes 사용 필요
+  - 현재는 사용자가 에디터에서 YawSign/PitchSign/RollSign 수동 조정으로 대응
+  - 확정 기본값: YawSign=-1, PitchSign=1, RollSign=-1
+
+### 상체 트래킹 시도 및 취소
+- Two Bone IK 방식으로 상체(팔) 트래킹 시도
+  - MediaPipe PoseLandmark 11-16 (어깨/팔꿈치/손목) → IK Effector/Joint Target
+  - MediaPipeToUE 좌표 변환 + 아바타 어깨 본 위치 기준 오프셋
+  - AnimBP Two Bone IK 노드 (J_Bip_L/R_Hand) 연결
+- 문제점:
+  - 좌표 스페이스 불일치 (월드 vs 컴포넌트)
+  - 스케일 매칭 어려움 (MediaPipe 정규화 좌표 → 아바타 본 길이)
+  - 팔 관절 부자연스럽게 꺾임
+  - 손가락 트래킹 불가 (PoseLandmarker는 손목까지만, HandLandmarker 별도 필요)
+- 결론: 손가락 트래킹 없이는 상체만 움직여도 부자연스러움 → 전체 취소, 코드 롤백
+
+### jawOpen 스케일 조정
+- VRoidBlendshapeMapping.csv: jawOpen(Fcl_MTH_A) 스케일 1.0 → 2.0 (입 크게 벌리기)

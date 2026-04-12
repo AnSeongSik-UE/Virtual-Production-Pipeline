@@ -8,7 +8,7 @@ Row_06,browOuterUpLeft,Fcl_BRW_Surprised,0.5
 Row_07,browOuterUpRight,Fcl_BRW_Surprised,0.5
 Row_08,eyeWideLeft,Fcl_EYE_Surprised,0.5
 Row_09,eyeWideRight,Fcl_EYE_Surprised,0.5
-Row_10,jawOpen,Fcl_MTH_A,1.0
+Row_10,jawOpen,Fcl_MTH_A,2.0
 Row_11,mouthSmileLeft,Fcl_EYE_Joy_L,0.3
 Row_12,mouthSmileRight,Fcl_EYE_Joy_R,0.3
 Row_13,mouthFunnel,Fcl_MTH_U,0.5
