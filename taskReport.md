@@ -175,3 +175,21 @@
   - [PASS] GPU: 평균 16.4ms (60fps 이내)
   - [PASS] GameThread: 안정 (트래킹 파이프라인 오버헤드 무시 수준)
   - CVar 튜닝 불필요 판단 (Lumen GI 간헐 스파이크만 존재)
+
+## 2026.04.12 (Phase 4)
+### Phase 4: OBS WebSocket 방송 자동화 + 원클릭 런처
+- `obs_controller.py` 구현:
+  - OBS WebSocket v5 연결 (obsws-python, port 4455)
+  - 씬 목록 조회, 씬 전환, 스트리밍 시작/중지, 녹화 시작/중지, 상태 조회
+  - OBS 비밀번호 `.env` 파일에서 로드 (코드 하드코딩 방지)
+- `launcher.py` 구현:
+  - Preflight check: 웹캠, UDP 포트, OBS WebSocket, MediaPipe 모델
+  - Tracker(sender.py) 자동 실행 + OBS 자동 연결
+  - 대화형 명령: stream, stop, rec, stoprec, status, quit
+  - 종료 시 스트리밍 중지 + 프로세스 정리
+- `.env` 파일 생성 (OBS WebSocket 비밀번호), `.gitignore`에 `.env` 추가
+- Preflight check 검증:
+  - [PASS] Webcam: Available
+  - [PASS] UDP port 7000: Available
+  - [PASS] OBS WebSocket: Connected (OBS v32.1.1, WebSocket v5.7.3)
+  - [PASS] MediaPipe models: All models found

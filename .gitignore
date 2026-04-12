@@ -90,6 +90,9 @@ VPPipeline/Plugins/VRM4U-master/
 # Claude Code worktree
 .claude/
 
+# Secrets
+.env
+
 # Python
 __pycache__/
 *.py[cod]
