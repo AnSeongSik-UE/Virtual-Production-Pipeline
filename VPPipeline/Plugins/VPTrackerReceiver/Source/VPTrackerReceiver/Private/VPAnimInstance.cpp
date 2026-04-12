@@ -37,6 +37,7 @@ void UVPAnimInstance::NativeUpdateAnimation(float DeltaSeconds)
 	if (TrackingData.bIsValid)
 	{
 		UpdatePoseBoneTransforms();
+		UpdateHeadRotation();
 	}
 }
 
@@ -130,6 +131,62 @@ void UVPAnimInstance::ApplyBlendshapesToMorphTargets()
 		MeshComp->SetMorphTarget(TargetName, FinalValue);
 		FaceBlendshapes.Add(TargetName, FinalValue);
 	}
+}
+
+void UVPAnimInstance::UpdateHeadRotation()
+{
+	if (!bEnableHeadTracking)
+	{
+		return;
+	}
+
+	// Need at least landmarks: 0(nose), 11(L shoulder), 12(R shoulder)
+	const int32 NumLandmarks = TrackingData.PoseLandmarks.Num();
+	if (NumLandmarks < 13)
+	{
+		return;
+	}
+
+	// MediaPipe landmark positions (normalized 0~1, X right, Y down)
+	const FVector2D Nose(TrackingData.PoseLandmarks[0].Position.X, TrackingData.PoseLandmarks[0].Position.Y);
+	const FVector2D LShoulder(TrackingData.PoseLandmarks[11].Position.X, TrackingData.PoseLandmarks[11].Position.Y);
+	const FVector2D RShoulder(TrackingData.PoseLandmarks[12].Position.X, TrackingData.PoseLandmarks[12].Position.Y);
+
+	// Also use depth (Z) for pitch
+	const float NoseZ = TrackingData.PoseLandmarks[0].Position.Z;
+	const float ShoulderZ = (TrackingData.PoseLandmarks[11].Position.Z + TrackingData.PoseLandmarks[12].Position.Z) * 0.5f;
+
+	// Shoulder midpoint as reference
+	const FVector2D ShoulderMid = (LShoulder + RShoulder) * 0.5f;
+	const float ShoulderWidth = FVector2D::Distance(LShoulder, RShoulder);
+
+	if (ShoulderWidth < 0.01f)
+	{
+		return;
+	}
+
+	// Yaw: nose horizontal offset from shoulder center, normalized by shoulder width
+	const float NoseOffsetX = (Nose.X - ShoulderMid.X) / ShoulderWidth;
+	const float Yaw = FMath::Clamp(NoseOffsetX * 60.0f * HeadRotationScale, -45.0f, 45.0f);
+
+	// Pitch: nose vertical offset from shoulder center (lower = looking down)
+	const float NoseOffsetY = (Nose.Y - ShoulderMid.Y) / ShoulderWidth;
+	const float NeutralOffset = -0.8f; // neutral head position is above shoulders
+	const float Pitch = FMath::Clamp((NoseOffsetY - NeutralOffset) * 60.0f * HeadRotationScale, -30.0f, 30.0f);
+
+	// Roll: shoulder tilt angle
+	const float ShoulderDeltaY = RShoulder.Y - LShoulder.Y;
+	const float Roll = FMath::Clamp(ShoulderDeltaY / ShoulderWidth * -40.0f * HeadRotationScale, -25.0f, 25.0f);
+
+	// VRoid bone axis: Roll->Pitch, Yaw, Pitch->Roll with sign multipliers
+	const FRotator TargetRotation(Roll * RollSign, Yaw * YawSign, Pitch * PitchSign);
+
+	// Smooth
+	SmoothedHeadRotation = FMath::Lerp(TargetRotation, SmoothedHeadRotation, HeadRotationSmoothing);
+	HeadRotation = SmoothedHeadRotation;
+
+	// HeadRotation is stored as a UPROPERTY for use in AnimBP (Transform Modify Bone node)
+	// or can be read from Blueprint to drive bone rotation.
 }
 
 void UVPAnimInstance::UpdatePoseBoneTransforms()

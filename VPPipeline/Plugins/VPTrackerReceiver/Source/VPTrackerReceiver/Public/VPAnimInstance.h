@@ -11,7 +11,7 @@ class UDataTable;
 /**
  * Custom AnimInstance that applies tracking data to skeletal mesh.
  * - Blendshape -> Morph Target (with optional DataTable remapping)
- * - Pose landmarks -> Bone Transform array
+ * - Pose landmarks -> Head bone rotation
  * Assign this as the Anim Class on your avatar's Skeletal Mesh Component.
  */
 UCLASS()
@@ -63,6 +63,38 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "VP Tracking")
 	bool bAutoFindReceiver = true;
 
+	// --- Head Rotation Tracking ---
+
+	/** Enable head rotation from pose landmarks */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "VP Head")
+	bool bEnableHeadTracking = true;
+
+	/** Head bone name on the avatar skeleton (VRoid: J_Bip_C_Head) */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "VP Head")
+	FName HeadBoneName = FName("J_Bip_C_Head");
+
+	/** Head rotation sensitivity multiplier */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "VP Head", meta = (ClampMin = "0.1", ClampMax = "3.0"))
+	float HeadRotationScale = 1.5f;
+
+	/** Axis sign multipliers — set to -1 to invert direction (adjustable in editor without rebuild) */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "VP Head", meta = (ClampMin = "-1.0", ClampMax = "1.0"))
+	float YawSign = -1.0f;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "VP Head", meta = (ClampMin = "-1.0", ClampMax = "1.0"))
+	float PitchSign = -1.0f;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "VP Head", meta = (ClampMin = "-1.0", ClampMax = "1.0"))
+	float RollSign = 1.0f;
+
+	/** Smoothing factor for head rotation (0 = no smoothing, 1 = max smoothing) */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "VP Head", meta = (ClampMin = "0.0", ClampMax = "0.95"))
+	float HeadRotationSmoothing = 0.5f;
+
+	/** Current head rotation (readable from Blueprint / AnimGraph) */
+	UPROPERTY(BlueprintReadOnly, Category = "VP Head")
+	FRotator HeadRotation;
+
 	/** Apply a complete tracking frame (blendshapes + pose) */
 	UFUNCTION(BlueprintCallable, Category = "VP Pipeline")
 	void ApplyTrackingData(const FVPTrackingFrame& Frame);
@@ -74,6 +106,10 @@ public:
 	/** Convert pose landmarks to bone transforms array */
 	UFUNCTION(BlueprintCallable, Category = "VP Tracking")
 	void UpdatePoseBoneTransforms();
+
+	/** Calculate and apply head rotation from pose landmarks */
+	UFUNCTION(BlueprintCallable, Category = "VP Head")
+	void UpdateHeadRotation();
 
 	virtual void NativeInitializeAnimation() override;
 	virtual void NativeUpdateAnimation(float DeltaSeconds) override;
@@ -87,4 +123,7 @@ private:
 	/** Cached receiver reference */
 	UPROPERTY()
 	TObjectPtr<UVPUDPReceiver> CachedReceiver;
+
+	/** Previous head rotation for smoothing */
+	FRotator SmoothedHeadRotation = FRotator::ZeroRotator;
 };
