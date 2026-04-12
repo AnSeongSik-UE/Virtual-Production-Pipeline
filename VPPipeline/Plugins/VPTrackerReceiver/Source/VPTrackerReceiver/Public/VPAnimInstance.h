@@ -28,6 +28,10 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "VP Tracking", meta = (ClampMin = "0.0", ClampMax = "2.0"))
 	float FaceBlendWeight = 1.0f;
 
+	/** Dead zone: blendshape values below this threshold are treated as 0 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "VP Tracking", meta = (ClampMin = "0.0", ClampMax = "0.5"))
+	float BlendshapeDeadZone = 0.15f;
+
 	/**
 	 * Optional DataTable (row type: FVPBlendshapeMapping) for ARKit -> Morph Target name remapping.
 	 * If null, ARKit names are used directly as morph target names.
@@ -46,6 +50,14 @@ public:
 	/** Position scale: converts normalized (0~1) MediaPipe coords to UE units */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "VP Pose", meta = (ClampMin = "1.0", ClampMax = "1000.0"))
 	float PosePositionScale = 100.0f;
+
+	/**
+	 * Rest pose morph targets applied as baseline every frame.
+	 * Example: set "Fcl_MTH_Close" = 1.0 to keep mouth closed by default.
+	 * Tracking values are added on top of these.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "VP Tracking")
+	TMap<FName, float> RestPoseMorphTargets;
 
 	/** Auto-find UVPUDPReceiver on the owning actor and feed data each frame */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "VP Tracking")

@@ -32,9 +32,10 @@ void UVPAnimInstance::NativeUpdateAnimation(float DeltaSeconds)
 		TrackingData = CachedReceiver->GetLatestTrackingData();
 	}
 
+	// Always apply rest pose + blendshapes (rest pose baseline even without tracking data)
+	ApplyBlendshapesToMorphTargets();
 	if (TrackingData.bIsValid)
 	{
-		ApplyBlendshapesToMorphTargets();
 		UpdatePoseBoneTransforms();
 	}
 }
@@ -90,6 +91,12 @@ void UVPAnimInstance::ApplyBlendshapesToMorphTargets()
 
 	const bool bHasMapping = CachedMapping.Num() > 0;
 
+	// Apply rest pose baseline first
+	for (const auto& RestPair : RestPoseMorphTargets)
+	{
+		MeshComp->SetMorphTarget(RestPair.Key, FMath::Clamp(RestPair.Value, 0.0f, 1.0f));
+	}
+
 	FaceBlendshapes.Reset();
 
 	for (const auto& Pair : TrackingData.FaceData.Blendshapes)
@@ -118,7 +125,8 @@ void UVPAnimInstance::ApplyBlendshapesToMorphTargets()
 			}
 		}
 
-		const float FinalValue = FMath::Clamp(Pair.Value * FaceBlendWeight * Scale, 0.0f, 1.0f);
+		const float RawValue = Pair.Value < BlendshapeDeadZone ? 0.0f : Pair.Value;
+		const float FinalValue = FMath::Clamp(RawValue * FaceBlendWeight * Scale, 0.0f, 1.0f);
 		MeshComp->SetMorphTarget(TargetName, FinalValue);
 		FaceBlendshapes.Add(TargetName, FinalValue);
 	}

@@ -157,4 +157,21 @@
   - [PASS] UDP 수신: ~60Hz, 351프레임 전송/수신 정상
   - [PASS] AnimInstance 자동 연결: VPUDPReceiver auto-connect 로그 확인
   - [PASS] DataTable 리매핑: ARKit -> VRoid Morph Target 변환 정상
-  - [PASS] 시각적 검증: 눈 깜빡임(eyeBlink -> Fcl_EYE_Close) + 입 벌림(mouthSmile -> Fcl_MTH_Joy/Fun) 확인
+  - [PASS] 시각적 검증: 눈 깜빡임(eyeBlink -> Fcl_EYE_Close) + 입 벌림(jawOpen -> Fcl_MTH_A) 확인
+- VRoid 매핑 튜닝:
+  - mouthPucker 비활성화 (MediaPipe 상시 노이즈 0.3~0.5)
+  - mouthFrownLeft/Right 비활성화 (노이즈)
+  - eyeBlink 스케일 1.0 -> 1.5 (완전 감김 보장)
+  - jawOpen 데드존 0.15 적용 (미세 노이즈 필터링)
+- VPAnimInstance 추가 기능:
+  - BlendshapeDeadZone: 임계값 미만 블렌드쉐이프 값 0 처리 (기본 0.15)
+  - RestPoseMorphTargets: 기본 Morph Target 값 설정 (Fcl_MTH_Close=1.0 등)
+  - Rest pose는 트래킹 데이터 없이도 항상 적용
+- 웹캠 실시간 트래킹 검증:
+  - [PASS] sender.py -> UDP -> VPAnimInstance 실시간 파이프라인 정상
+  - [PASS] 눈 깜빡임 + 입 벌림 실시간 반영 확인
+- Unreal Insights 프로파일링:
+  - [PASS] Frame Time: ~10.4ms (약 96fps, 목표 60fps 초과)
+  - [PASS] GPU: 평균 16.4ms (60fps 이내)
+  - [PASS] GameThread: 안정 (트래킹 파이프라인 오버헤드 무시 수준)
+  - CVar 튜닝 불필요 판단 (Lumen GI 간헐 스파이크만 존재)
