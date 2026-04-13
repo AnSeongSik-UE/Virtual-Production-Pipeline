@@ -241,3 +241,8 @@
 
 ### jawOpen 스케일 조정
 - VRoidBlendshapeMapping.csv: jawOpen(Fcl_MTH_A) 스케일 1.0 → 2.0 (입 크게 벌리기)
+
+## 2026.04.13 14:30:22
+### 프로젝트 Git 커밋 및 푸시
+- `README.md` 포트폴리오 완성본 및 그동안의 `taskReport.md` 변경 내역 저장
+- 프로젝트 전체 작업 내역 로컬 커밋 및 원격 저장소 푸시
