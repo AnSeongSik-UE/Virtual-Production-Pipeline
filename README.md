@@ -6,11 +6,10 @@
 
 본 프로젝트는 단일 웹캠과 비전 AI(MediaPipe)를 활용하여 언리얼 엔진 5.7 환경에서 구동되는 **실시간 버추얼 프로덕션 파이프라인**입니다. 파이썬 기반 런처 스크립트와 OBS Studio 연동을 통해 모션 캡처 추론부터 방송 라이브 송출 제어까지의 기능을 일원화했습니다. (단, 렌더링을 담당하는 언리얼 엔진과 OBS 프로그램 본체는 사전에 띄워두어야 합니다.)
 
-## ✨ 주요 특징
-- **Low-Latency Tracking**: 웹캠 기반 MediaPipe 듀얼 랜드마커(Face 52개 블렌드쉐이프, Pose 33개 관절) 동시 추론.
-- **Custom UE C++ Plugin**: 블루프린트 노드 오버헤드 없이, 언리얼 엔진 C++로 직조된 전용 소켓 수신기(`VPTrackerReceiver`)를 통해 SPSC 큐(Thread-Safe) 기반 고성능 바이너리 파싱 지원.
-- **Animation Retargeting**: C++ `VPAnimInstance` 및 커스텀 DataTable 매핑을 통한 ARKit -> 리깅 아바타 동적 호환 보장. (Yaw/Pitch/Roll 기반 Head IK 완비)
-- **DevOps & Broadcasting**: OBS WebSocket을 제어하는 파이썬 스크립트(`obs_controller.py`)와 런처를 제공하여, AI 트래킹 모듈의 생명주기와 방송 플랫폼(스트리밍/녹화) 제어를 커맨드라인에서 일원화하여 손쉽게 관리.
+## ✨ 주요 핵심 역량
+- **고성능 병렬 네트워킹**: C++ 전용 소켓 수신기와 스레드 세이프(SPSC Queue) 구조를 구현하여 블루프린트 오버헤드 없는 실시간 제어 성능 확보
+- **AI 리타겟팅 파이프라인**: 듀얼 추론(Face/Pose) 데이터와 캐릭터 리깅 에셋 간의 명명 불일치를 커스텀 DataTable로 매핑 및 캡슐화하여 확장성 극대화
+- **방송 제어 자동화 설계**: 터미널 런처 하나로 모션 캡처 구동부터 OBS WebSocket 기반 스트리밍 라이프사이클 통제까지 전체 워크플로우를 일원화
 
 ## 🚀 아키텍처 다이어그램
 
