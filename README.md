@@ -1,61 +1,170 @@
-# 🎥 Virtual Production Pipeline (UE 5.7)
+# Virtual Production Pipeline
 
 <p align="center">
-  <img src="./Virtual%20Production%20Pipeline.gif" alt="Virtual Production Pipeline Demo">
+  <img src="./Virtual%20Production%20Pipeline.gif" alt="Virtual Production Pipeline demo">
 </p>
 
-본 프로젝트는 단일 웹캠과 비전 AI(MediaPipe)를 활용하여 언리얼 엔진 5.7 환경에서 구동되는 **실시간 버추얼 프로덕션 파이프라인**입니다. 파이썬 기반 런처 스크립트와 OBS Studio 연동을 통해 모션 캡처 추론부터 방송 라이브 송출 제어까지의 기능을 일원화했습니다. (단, 렌더링을 담당하는 언리얼 엔진과 OBS 프로그램 본체는 사전에 띄워두어야 합니다.)
+> **데모 구성**
+> Unreal Engine 아바타 출력, Python 런처, OBS 제어 화면을 통해 웹캠 트래킹 데이터의 엔진 연동과 송출 제어 흐름을 보여 줍니다. 개인정보 보호를 위해 웹캠 원본 화면은 포함하지 않았습니다.
 
-## ✨ 주요 핵심 역량
-- **고성능 병렬 네트워킹**: C++ 전용 소켓 수신기와 스레드 세이프(SPSC Queue) 구조를 구현하여 블루프린트 오버헤드 없는 실시간 제어 성능 확보
-- **AI 리타겟팅 파이프라인**: 듀얼 추론(Face/Pose) 데이터와 캐릭터 리깅 에셋 간의 명명 불일치를 커스텀 DataTable로 매핑 및 캡슐화하여 확장성 극대화
-- **방송 제어 자동화 설계**: 터미널 런처 하나로 모션 캡처 구동부터 OBS WebSocket 기반 스트리밍 라이프사이클 통제까지 전체 워크플로우를 일원화
+단일 웹캠에서 얼굴과 포즈 데이터를 추론하고, 이를 Unreal Engine 5.7에 전달해 아바타 표정과 머리 움직임에 반영하는 실시간 파이프라인 프로젝트입니다.
 
-## 💻 요구 사항 (Prerequisites)
-- **Hardware**: 720p 30fps 이상 지원 웹캠, NVIDIA RTX 3060 이상(또는 동급 GPU 권장), RAM 16GB 이상
-- **Software**: 
-  - Python 3.12+ (및 `uv` 패키지 매니저)
-  - Unreal Engine 5.7
-  - OBS Studio v32.0 이상 (WebSocket 서버 활성화 필수)
+Python에서 MediaPipe 기반 추론과 UDP 송신을 담당하고, Unreal Engine에서는 C++ 수신 플러그인과 DataTable 기반 Morph Target 매핑을 구현했습니다. OBS WebSocket을 이용해 스트리밍과 녹화도 제어합니다.
 
-## 🛠 설치 및 시작 가이드 (Getting Started)
+## 데이터 흐름
 
-### 1. 파이썬 환경 세팅
+![Virtual Production Pipeline Architecture](./vp_architecture.png)
+
+웹캠에서 추론한 얼굴·포즈 데이터를 Python이 Binary UDP로 전송하고, Unreal Engine C++ 수신 플러그인이 이를 처리합니다. 아바타에는 얼굴 Blendshape와 머리 회전을 반영하며, 런처는 OBS의 스트리밍·녹화 제어를 담당합니다.
+
+## 구현 범위
+
+- 웹캠 기반 얼굴 Blendshape 추론 및 아바타 Morph Target 반영
+- 포즈 랜드마크 수신 및 머리 회전 계산·반영
+- Python → Binary UDP → Unreal Engine C++ 수신 플러그인 연동
+- DataTable 기반 ARKit 호환 Blendshape와 VRoid Morph Target 매핑
+- OBS WebSocket 기반 스트리밍·녹화 제어
+- 런처 기반 사전 점검 및 실행 상태 확인
+
+현재 포즈 랜드마크는 추론·전송·수신까지 구현되어 있습니다. 아바타에 실제 반영되는 범위는 얼굴 Blendshape와 머리 회전이며, 전신·상체 본 리타게팅은 포함하지 않습니다.
+
+## 주요 구현
+
+### 웹캠 트래킹
+
+- OpenCV로 웹캠 영상 수신
+- MediaPipe FaceLandmarker로 얼굴 Blendshape 추론
+- MediaPipe PoseLandmarker로 포즈 랜드마크 추론
+- 추론 스레드와 송신부 사이에서 최신 프레임 우선 큐를 사용해 오래된 프레임 제거
+
+### Unreal Engine C++ 수신 플러그인
+
+- `VPTrackerReceiver` 런타임 플러그인 구현
+- 바이너리 UDP 패킷의 헤더·길이 검증
+- 네트워크 수신 스레드와 게임 스레드를 SPSC 큐로 분리
+- 게임 스레드에서는 누적 프레임 대신 최신 프레임을 적용
+
+### 아바타 리타게팅
+
+- ARKit 호환 Blendshape 이름과 VRoid Morph Target 이름의 차이를 DataTable로 관리
+- 표정별 가중치와 데드존을 설정값으로 분리
+- 매핑 테이블은 최초 1회 캐싱해 런타임에서 재사용
+- 어깨·코 랜드마크를 기반으로 머리 Pitch·Yaw·Roll 계산
+- 머리 회전에 스무딩과 프레임별 변화량 제한을 적용해 떨림 완화
+
+### OBS 제어
+
+- OBS WebSocket 연결 및 상태 확인
+- 스트리밍 시작·중지
+- 로컬 녹화 시작·중지
+- 런처에서 트래커 프로세스와 OBS 송출 상태 확인
+
+## 프로젝트 구성
+
+```text
+VP/
+├─ VPPipeline/
+│  ├─ Plugins/VPTrackerReceiver/   # Unreal Engine C++ UDP 수신 플러그인
+│  ├─ Content/
+│  │  ├─ Actor/BP_Receiver         # 수신 Actor 예제
+│  │  ├─ Data/VRoidBlendshapeMapping
+│  │  └─ Maps/Lvl_Empty
+│  └─ VPPipeline.uproject
+│
+└─ vp-tracker/
+   ├─ tracker.py                   # 웹캠·MediaPipe 추론
+   ├─ sender.py                    # UDP 송신
+   ├─ obs_controller.py            # OBS WebSocket 제어
+   ├─ launcher.py                  # 사전 점검·실행·상태 확인
+   └─ models/                      # MediaPipe 모델 파일
+```
+
+## 실행 환경
+
+- Unreal Engine 5.7
+- Python 3.12 이상
+- `uv`
+- 웹캠
+- OBS Studio 및 WebSocket 서버
+- MediaPipe 모델 파일
+  - `models/face_landmarker.task`
+  - `models/pose_landmarker_heavy.task`
+
+실제 추론 FPS는 웹캠과 실행 환경에 따라 달라집니다.
+
+## 실행 방법
+
+### 1. Python 환경 구성
+
 ```bash
-# 프로젝트 패키지 경로 진입
 cd vp-tracker
-# uv를 통한 빠르고 완벽한 의존성 설치
 uv sync
 ```
 
-### 2. OBS 세팅 및 환경 변수 구성
-`.env` 파일을 `vp-tracker` 폴더 루트에 구성하여 OBS WebSocket 연결 비밀번호를 설정합니다.
+### 2. OBS WebSocket 비밀번호 설정
+
+`vp-tracker` 폴더에 `.env` 파일을 생성합니다.
+
 ```env
-VP_OBS_PASSWORD=본인_OBS_웹소켓_비밀번호
+VP_OBS_PASSWORD=your_obs_websocket_password
 ```
 
-### 3. 언리얼 플러그인 빌드
-1. `VPPipeline.uproject` 파일 우클릭 후 **Generate Visual Studio project files** 클릭합니다.
-2. 자동으로 생성된 `.sln` 파일을 통해 솔루션을 다시 빌드하거나, 엔진을 재실행하여 플러그인(`VPTrackerReceiver`)을 자동으로 컴파일합니다.
+### 3. Unreal Engine 프로젝트 준비
 
-## 🎮 사용 방법 (Usage)
-언리얼 엔진 에디터에 접속해 Play(PIE) 버튼을 누르고 OBS Studio를 켜둔 상태에서, 터미널 명령어를 통해 워크플로우를 시작합니다.
+1. `VPPipeline.uproject`를 열어 `VPTrackerReceiver` 플러그인을 빌드합니다.
+2. 기본 맵 `/Game/Maps/Lvl_Empty`를 엽니다.
+3. Unreal Editor는 실행하되, 런처 실행 전에는 PIE를 시작하지 않습니다.
+
+### 4. 런처 실행
 
 ```bash
+cd vp-tracker
 uv run launcher.py
 ```
-런처가 실행된 이후 대화형 프롬프트에 아래의 명령어를 입력하여 방송을 제어할 수 있습니다.
-- `stream` : OBS 스트리밍 송출 시작
-- `rec` : 로컬 녹화 시작
-- `status` : 트래킹 및 파이프라인 연결 상태 출력
-- `stop` / `stoprec` : 스트리밍 / 녹화 파기 종료
-- `quit` : 파이프라인 프로세스 및 런처 완전 종료
 
-## 🔧 주요 트러블슈팅 및 기술적 극복 사례 (Troubleshooting)
+사전 점검과 트래커 실행이 완료되면 Unreal Editor에서 PIE를 시작합니다.
 
-- **ARKit 표정 명명 규칙과 커스텀 캐릭터 리깅 사이의 불일치 이슈 극복**
-  - **문제**: MediaPipe의 추론 모델은 `eyeBlinkLeft` 등 애플의 표준 ARKit 네이밍을 도출하지만, 프로젝트에 이식된 VRoid 아바타는 `Fcl_EYE_Close_L` 방식의 비표준 Morph Target 네이밍을 사용하여 표정이 곧바로 엔진 내 캐릭터에 매핑되지 않았습니다.
-  - **해결**: 단순히 코드를 하드코딩하는 방식 대신, 언리얼 `DataTable` 형태의 중간 매핑 아키텍처를 `VPAnimInstance`에 설계하였습니다. 이를 통해 런타임 성능 오버헤드 없이 유연한 이름 조합 매핑과 스케일 팩터 조정을 달성했습니다. (예: `jawOpen` 변수는 스케일 2.0 부스팅 및 미세 노이즈 필터링 데드존 0.15로 최적화)
-  
----
-*Powered by MediaPipe & Unreal Engine 5.7*
+```text
+stream   # OBS 스트리밍 시작
+stop     # OBS 스트리밍 중지
+rec      # 로컬 녹화 시작
+stoprec  # 로컬 녹화 중지
+status   # 트래커 프로세스와 OBS 상태 확인
+quit     # 트래커 종료 및 OBS 연결 해제
+```
+
+`status`는 트래커 프로세스와 OBS 연결·송출 상태를 확인합니다. Unreal Engine의 실제 수신 상태는 Output Log에서 확인할 수 있습니다.
+
+## 리타게팅 문제 해결
+
+### 문제
+
+MediaPipe의 Blendshape 이름과 VRoid 아바타의 Morph Target 이름이 달라 추론 결과를 바로 적용할 수 없었습니다.
+
+### 해결
+
+`FVPBlendshapeMapping` 구조체와 DataTable을 사용해 입력 Blendshape 이름, 대상 Morph Target 이름, 가중치를 분리했습니다.
+
+`VPAnimInstance`는 DataTable을 최초 1회 캐싱한 뒤 매 프레임 캐시된 매핑을 사용합니다. 이를 통해 캐릭터별 명명 규칙과 표정 강도를 코드 수정 없이 조정할 수 있습니다.
+
+## 검증 방법
+
+### 웹캠·MediaPipe 트래킹 확인
+
+```bash
+cd vp-tracker
+uv run test_phase1.py
+```
+
+웹캠 입력, Blendshape 개수, 포즈 랜드마크 개수, 추론 FPS를 콘솔에서 확인합니다.
+
+### Unreal Engine 수신·표정 반영 확인
+
+Unreal Editor에서 PIE를 실행한 뒤 다음 명령을 실행합니다.
+
+```bash
+cd vp-tracker
+uv run test_phase3.py
+```
+
+테스트 패킷을 전송하고 Unreal Output Log의 수신 로그와 아바타의 표정 변화를 확인합니다.
