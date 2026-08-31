@@ -11,6 +11,17 @@
 
 Python에서 MediaPipe 기반 추론과 UDP 송신을 담당하고, Unreal Engine에서는 C++ 수신 플러그인과 DataTable 기반 Morph Target 매핑을 구현했습니다. OBS WebSocket을 이용해 스트리밍과 녹화도 제어합니다.
 
+## 목차
+
+- [데이터 흐름](#데이터-흐름)
+- [구현 범위](#구현-범위)
+- [주요 구현](#주요-구현)
+- [프로젝트 구성](#프로젝트-구성)
+- [실행 환경](#실행-환경)
+- [실행 방법](#실행-방법)
+- [리타게팅 문제 해결](#리타게팅-문제-해결)
+- [검증 방법](#검증-방법)
+
 ## 데이터 흐름
 
 ![Virtual Production Pipeline Architecture](./vp_architecture.png)
