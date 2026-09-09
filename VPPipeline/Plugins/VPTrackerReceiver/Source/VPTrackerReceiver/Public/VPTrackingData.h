@@ -53,6 +53,14 @@ struct VPTRACKERRECEIVER_API FVPPoseLandmark
 	/** Normalized position (0~1) */
 	UPROPERTY(BlueprintReadOnly, Category = "VP Tracking")
 	FVector Position = FVector::ZeroVector;
+
+	/** MediaPipe landmark visibility confidence (0.0 ~ 1.0) */
+	UPROPERTY(BlueprintReadOnly, Category = "VP Tracking")
+	float Visibility = 0.0f;
+
+	/** MediaPipe landmark presence confidence (0.0 ~ 1.0) */
+	UPROPERTY(BlueprintReadOnly, Category = "VP Tracking")
+	float Presence = 0.0f;
 };
 
 /**
@@ -66,6 +74,22 @@ struct VPTRACKERRECEIVER_API FVPTrackingFrame
 
 	UPROPERTY(BlueprintReadOnly, Category = "VP Tracking")
 	double Timestamp = 0.0;
+
+	/** Local high-resolution receive timestamp; not part of the VPTP wire contract. */
+	double ReceiveTimestampMilliseconds = 0.0;
+
+	UPROPERTY(BlueprintReadOnly, Category = "VP Tracking")
+	int64 FrameId = 0;
+
+	UPROPERTY(BlueprintReadOnly, Category = "VP Tracking")
+	bool bFaceTracked = false;
+
+	/** MediaPipe canonical-face rotation. Pitch/Yaw/Roll retain facial semantic axes. */
+	UPROPERTY(BlueprintReadOnly, Category = "VP Tracking")
+	FRotator FaceRotation = FRotator::ZeroRotator;
+
+	UPROPERTY(BlueprintReadOnly, Category = "VP Tracking")
+	bool bPoseTracked = false;
 
 	UPROPERTY(BlueprintReadOnly, Category = "VP Tracking")
 	FVPBlendshapeData FaceData;

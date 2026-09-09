@@ -1,0 +1,164 @@
+diff --git a/Source/VRM4ULoader/Private/LoaderBPFunctionLibrary.cpp b/Source/VRM4ULoader/Private/LoaderBPFunctionLibrary.cpp
+--- a/Source/VRM4ULoader/Private/LoaderBPFunctionLibrary.cpp
++++ b/Source/VRM4ULoader/Private/LoaderBPFunctionLibrary.cpp
+@@ -849,15 +849,18 @@ bool ULoaderBPFunctionLibrary::LoadVRMFileFromMemory(const UVrmAssetListObject *
+ 			return false;
+ 		}
+ 		{
+-			// 後処理。UE5.7ではCreateMeshDescription を呼ぶため必要
+-			if (out->SkeletalMesh) {
++			// Editor asset import needs PostLoad. Runtime-created meshes are finalized
++			// by the conversion path and can assert here in PIE/standalone.
++			if (VRMConverter::IsImportMode() && out->SkeletalMesh) {
+ 				out->SkeletalMesh->PostLoad();
+ 			}
+ 		}
+ 	}
+ 	out->VrmMetaObject->SkeletalMesh = out->SkeletalMesh;
+ 
+-	VRMSetPhysicsAsset(out->VrmMetaObject->SkeletalMesh, nullptr);
++	if (VRMConverter::IsImportMode()) {
++		VRMSetPhysicsAsset(out->VrmMetaObject->SkeletalMesh, nullptr);
++	}
+ 
+ 
+ 	{
+diff --git a/Source/VRM4ULoader/Private/VrmConvertModel_Description.cpp b/Source/VRM4ULoader/Private/VrmConvertModel_Description.cpp
+--- a/Source/VRM4ULoader/Private/VrmConvertModel_Description.cpp
++++ b/Source/VRM4ULoader/Private/VrmConvertModel_Description.cpp
+@@ -2346,6 +2346,7 @@ bool VRMConverter::ConvertModel_internal_description(UVrmAssetListObject *vrmAss
+ 
+ 
+ #if WITH_EDITOR
++	if (VRMConverter::IsImportMode()) {
+ 	// animation
+ 	if (aiData->mNumAnimations > 0) {
+ 		UAnimSequence* ase;
+@@ -2606,6 +2607,7 @@ bool VRMConverter::ConvertModel_internal_description(UVrmAssetListObject *vrmAss
+ 			}
+ 		}
+ 	}
++	}
+ #endif
+ 
+ 	return true;
+diff --git a/Source/VRM4ULoader/Private/VrmConvertMorphTarget.cpp b/Source/VRM4ULoader/Private/VrmConvertMorphTarget.cpp
+--- a/Source/VRM4ULoader/Private/VrmConvertMorphTarget.cpp
++++ b/Source/VRM4ULoader/Private/VrmConvertMorphTarget.cpp
+@@ -587,7 +587,7 @@ bool VRMConverter::ConvertMorphTarget(UVrmAssetListObject *vrmAssetList) {
+ #if WITH_EDITOR
+ #if	UE_VERSION_OLDER_THAN(5,3,0)
+ #else
+-		{
++		if (VRMConverter::IsImportMode()) {
+ 			TArray<FName> namelist;
+ 			VRMGetSkeleton(sk)->GetCurveMetaDataNames(namelist);
+ 			for (auto name : namelist) {
+@@ -625,14 +625,16 @@ bool VRMConverter::ConvertMorphTarget(UVrmAssetListObject *vrmAssetList) {
+ 	//MorphLODModelsPerTargetName
+ #endif
+ 
+-	for (auto name : MorphNameList) {
+-		FCurveMetaData* FoundCurveMetaData = VRMGetSkeleton(sk)->GetCurveMetaData(*name);
+-		if (FoundCurveMetaData) {
+-			FoundCurveMetaData->Type.bMorphtarget = true;
+-			continue;
+-		}
++	if (VRMConverter::IsImportMode() && VRMGetSkeleton(sk)) {
++		for (auto name : MorphNameList) {
++			FCurveMetaData* FoundCurveMetaData = VRMGetSkeleton(sk)->GetCurveMetaData(*name);
++			if (FoundCurveMetaData) {
++				FoundCurveMetaData->Type.bMorphtarget = true;
++				continue;
++			}
+ 
+-		VRMGetSkeleton(sk)->AccumulateCurveMetaData(*name, false, true);
++			VRMGetSkeleton(sk)->AccumulateCurveMetaData(*name, false, true);
++		}
+ 	}
+ 
+ #if WITH_EDITOR
+diff --git a/Source/VRM4ULoader/Private/VrmConvertPose.cpp b/Source/VRM4ULoader/Private/VrmConvertPose.cpp
+--- a/Source/VRM4ULoader/Private/VrmConvertPose.cpp
++++ b/Source/VRM4ULoader/Private/VrmConvertPose.cpp
+@@ -794,6 +794,12 @@ bool VRMConverter::ConvertPose(UVrmAssetListObject *vrmAssetList) {
+ 		return false;
+ 	}
+ 
++	// Runtime-loaded avatars are driven directly by VPPipeline's native AnimInstance.
++	// Pose assets are editor import artifacts and are unsafe to create in -game/PIE.
++	if (!VRMConverter::IsImportMode()) {
++		return true;
++	}
++
+ 	bool bPlay = false;
+ 	{
+ 		bool b1, b2, b3;
+diff --git a/Source/VRM4ULoader/VRM4ULoader.Build.cs b/Source/VRM4ULoader/VRM4ULoader.Build.cs
+--- a/Source/VRM4ULoader/VRM4ULoader.Build.cs
++++ b/Source/VRM4ULoader/VRM4ULoader.Build.cs
+@@ -32,6 +32,6 @@ public class VRM4ULoader : ModuleRules
+ 			if (unityBuildProperty != null)
+ 			{
+ 				// UE5.8+
+-			//	unityBuildProperty.SetValue(this, false);
++				unityBuildProperty.SetValue(this, false);
+ 			}
+ 		}
+@@ -40,7 +40,7 @@ public class VRM4ULoader : ModuleRules
+ 			var unityProperty = GetType().GetProperty("bUseUnity", BindingFlags.Public | BindingFlags.Instance);
+ 			if (unityProperty != null)
+ 			{
+-			//	unityProperty.SetValue(this, false);
++				unityProperty.SetValue(this, false);
+ 			}
+ 		}
+ 
+diff --git a/Source/VRM4ULoader/Private/VrmLoaderComponent.cpp b/Source/VRM4ULoader/Private/VrmLoaderComponent.cpp
+--- a/Source/VRM4ULoader/Private/VrmLoaderComponent.cpp
++++ b/Source/VRM4ULoader/Private/VrmLoaderComponent.cpp
+@@ -21,6 +21,9 @@ void UVrmLoaderComponent::OnRegister()
+ 
+ void UVrmLoaderComponent::OnUnregister()
+ {
++	bResultQueue = false;
++	AssetList = nullptr;
++	SetComponentTickEnabled(false);
+ 	Super::OnUnregister();
+ }
+ 
+@@ -30,7 +33,13 @@ bool UVrmLoaderComponent::LoadVRMFile(const UVrmAssetListObject *InVrmAsset, UVr
+ bool UVrmLoaderComponent::LoadVRMFileAsync(const UVrmAssetListObject *InVrmAsset, FString filepath) {
+ 
+-	ULoaderBPFunctionLibrary::LoadVRMFileLocal(InVrmAsset, AssetList, filepath);
++	if (!ULoaderBPFunctionLibrary::LoadVRMFileLocal(InVrmAsset, AssetList, filepath)) {
++		AssetList = nullptr;
++		bResultQueue = false;
++		SetComponentTickEnabled(false);
++		return false;
++	}
+ 	bResultQueue = true;
++	SetComponentTickEnabled(true);
+ 	return true;
+ }
+ 
+@@ -42,5 +52,7 @@ void UVrmLoaderComponent::TickComponent(float DeltaTime, enum ELevelTick TickTyp
+ 	if (bResultQueue) {
+ 		bResultQueue = false;
+ 		OnFinishLoad.Broadcast(AssetList);
++		AssetList = nullptr;
++		SetComponentTickEnabled(false);
+ 	}
+ }
+diff --git a/Source/VRM4U/Private/VrmDropFiles.cpp b/Source/VRM4U/Private/VrmDropFiles.cpp
+--- a/Source/VRM4U/Private/VrmDropFiles.cpp
++++ b/Source/VRM4U/Private/VrmDropFiles.cpp
+@@ -80,7 +80,7 @@ bool UVrmDropFilesComponent::VRMGetOpenFileName(FString &FileName) {
+ 		TEXT("VRM file(*.vrm)\0*.vrm\0")
+ 		TEXT("all file(*.*)\0*.*\0\0");
+ 	ofn.lpstrFile = filename;
+-	ofn.nMaxFile = sizeof(filename);
++	ofn.nMaxFile = UE_ARRAY_COUNT(filename);
+ 	ofn.Flags = OFN_FILEMUSTEXIST | OFN_HIDEREADONLY;
+ 	//ofn.lpstrDefExt = TEXT("*");
+ 	ofn.lpstrTitle = TEXT("Model");

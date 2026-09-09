@@ -1,7 +1,7 @@
 [project]
 name = "vp-tracker"
 version = "0.1.0"
-description = "Add your description here"
+description = "MediaPipe-to-Unreal real-time face, head, and upper-arm tracking pipeline"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [

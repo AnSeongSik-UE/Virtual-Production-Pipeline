@@ -1,80 +1,117 @@
 """VP Pipeline 전용 MCP 서버 - AI 어시스턴트가 파이프라인 상태를 진단/제어"""
-from mcp.server.fastmcp import FastMCP
 import socket
 import os
+from mcp.server.fastmcp import FastMCP
+from obs_controller import _load_password
+from protocol import (
+    BLENDSHAPE_COUNT,
+    EXPECTED_PACKET_SIZE,
+    MAGIC,
+    POSE_LANDMARK_COUNT,
+    SCHEMA_VERSION,
+)
 
 mcp = FastMCP("VP Pipeline Tools")
 
 @mcp.tool()
-def check_port_available(port: int) -> str:
-    """UDP/OSC 포트가 사용 가능한지 확인"""
+def check_udp_listener(port: int = 7000) -> dict:
+    """UDP 포트 바인딩 여부를 확인한다. 프로세스 소유자는 판별할 수 없다."""
     try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.bind(('127.0.0.1', port))
-        s.close()
-        return f"[OK] Port {port} is available"
-    except OSError as e:
-        return f"[FAIL] Port {port} is already in use: {e}"
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
+            probe.bind(("127.0.0.1", port))
+        return {
+            "status": "warning",
+            "port": port,
+            "bound": False,
+            "message": "No UDP listener detected; start Unreal PIE before tracking",
+        }
+    except OSError:
+        return {
+            "status": "ok",
+            "port": port,
+            "bound": True,
+            "message": "UDP port is bound; owner is not verifiable from this probe",
+        }
 
 @mcp.tool()
-def check_webcam() -> str:
+def check_webcam() -> dict:
     """노트북 웹캠 접근 가능 여부 확인"""
+    cap = None
     try:
         import cv2
         cap = cv2.VideoCapture(0)
         if cap.isOpened():
             ret, frame = cap.read()
             h, w = frame.shape[:2] if ret else (0, 0)
-            cap.release()
-            return f"[OK] Webcam OK - Resolution: {w}x{h}"
-        return "[FAIL] Webcam not accessible"
+            return {"status": "ok", "width": w, "height": h}
+        return {"status": "error", "message": "Webcam not accessible"}
     except ImportError:
-        return "[FAIL] OpenCV not installed"
+        return {"status": "error", "message": "OpenCV not installed"}
     except Exception as e:
-        return f"[FAIL] Webcam error: {type(e).__name__}"
+        return {"status": "error", "message": f"Webcam error: {type(e).__name__}"}
+    finally:
+        if cap is not None:
+            cap.release()
 
 @mcp.tool()
-def check_obs_connection(port: int = 4455, password: str = "") -> str:
-    """OBS WebSocket 연결 상태 확인"""
+def check_obs_connection(port: int = 4455) -> dict:
+    """OBS WebSocket 연결 상태를 확인한다. 비밀번호는 환경/.env에서만 읽는다."""
     try:
         import obsws_python as obs
-        client = obs.ReqClient(host='localhost', port=port, password=password, timeout=3)
+        client = obs.ReqClient(host="localhost", port=port, password=_load_password(), timeout=3)
         ver = client.get_version()
         client.disconnect()
-        return f"[OK] OBS Connected - Version: {ver.obs_version}"
+        return {"status": "ok", "version": ver.obs_version, "port": port}
     except ImportError:
-        return "[FAIL] obsws-python not installed"
+        return {"status": "error", "message": "obsws-python not installed"}
     except ConnectionRefusedError:
-        return "[FAIL] OBS not running or WebSocket disabled"
+        return {"status": "warning", "message": "OBS not running or WebSocket disabled"}
     except Exception as e:
-        return f"[FAIL] OBS Connection Failed: {type(e).__name__}"
+        return {"status": "warning", "message": f"OBS connection failed: {type(e).__name__}"}
 
 @mcp.tool()
-def check_mediapipe_models() -> str:
+def check_mediapipe_models() -> dict:
     """MediaPipe Task 모델 파일 존재 여부 확인"""
+    from tracker import POSE_MODEL_FILES, selected_pose_model
+
+    selected = selected_pose_model()
     models = {
         "face_landmarker.task": "FaceLandmarker",
-        "pose_landmarker_heavy.task": "PoseLandmarker"
+        POSE_MODEL_FILES[selected]: f"PoseLandmarker ({selected})",
     }
-    results = []
+    results = {}
     for filename, name in models.items():
-        path = os.path.join("models", filename)
+        path = os.path.join(os.path.dirname(__file__), "models", filename)
         if os.path.exists(path):
             size_mb = os.path.getsize(path) / (1024*1024)
-            results.append(f"[OK] {name}: {path} ({size_mb:.1f}MB)")
+            results[name] = {"status": "ok", "path": path, "size_mb": round(size_mb, 1)}
         else:
-            results.append(f"[FAIL] {name}: {path} NOT FOUND")
-    return "\n".join(results)
+            results[name] = {"status": "error", "path": path, "message": "not found"}
+    return results
 
 @mcp.tool()
-def run_pipeline_diagnostics() -> str:
+def get_tracking_protocol() -> dict:
+    """Python/Unreal이 공유하는 VPTP 스키마 계약 정보를 반환한다."""
+    return {
+        "magic": MAGIC.decode("ascii"),
+        "name": "Virtual Production Tracking Packet",
+        "schema_version": SCHEMA_VERSION,
+        "packet_size_bytes": EXPECTED_PACKET_SIZE,
+        "blendshape_count": BLENDSHAPE_COUNT,
+        "pose_landmark_count": POSE_LANDMARK_COUNT,
+        "pose_fields": ["x", "y", "z", "visibility", "presence"],
+    }
+
+@mcp.tool()
+def run_pipeline_diagnostics() -> dict:
     """전체 파이프라인 사전 진단 (원클릭)"""
-    checks = []
-    checks.append(check_webcam())
-    checks.append(check_port_available(7000))   # UDP 트래킹 포트
-    checks.append(check_port_available(4455))   # OBS WebSocket 포트
-    checks.append(check_mediapipe_models())
-    return "\n".join(["=== Pipeline Diagnostics ==="] + checks)
+    return {
+        "webcam": check_webcam(),
+        "unreal_udp": check_udp_listener(7000),
+        "obs": check_obs_connection(4455),
+        "models": check_mediapipe_models(),
+        "protocol": get_tracking_protocol(),
+    }
 
 if __name__ == "__main__":
     mcp.run()

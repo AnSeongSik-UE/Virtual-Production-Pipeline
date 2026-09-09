@@ -2,70 +2,39 @@
 Sends mock tracking data via UDP and verifies packet format.
 UE side verification: check Output Log for VPAnimInstance/VPUDPReceiver messages.
 """
-import struct
 import socket
 import time
-
-
-# ARKit 52 blendshape names (same order as VPUDPReceiver.cpp)
-ARKIT_NAMES = [
-    "_neutral",
-    "browDownLeft", "browDownRight",
-    "browInnerUp",
-    "browOuterUpLeft", "browOuterUpRight",
-    "cheekPuff",
-    "cheekSquintLeft", "cheekSquintRight",
-    "eyeBlinkLeft", "eyeBlinkRight",
-    "eyeLookDownLeft", "eyeLookDownRight",
-    "eyeLookInLeft", "eyeLookInRight",
-    "eyeLookOutLeft", "eyeLookOutRight",
-    "eyeLookUpLeft", "eyeLookUpRight",
-    "eyeSquintLeft", "eyeSquintRight",
-    "eyeWideLeft", "eyeWideRight",
-    "jawForward", "jawLeft", "jawOpen", "jawRight",
-    "mouthClose",
-    "mouthDimpleLeft", "mouthDimpleRight",
-    "mouthFrownLeft", "mouthFrownRight",
-    "mouthFunnel",
-    "mouthLeft",
-    "mouthLowerDownLeft", "mouthLowerDownRight",
-    "mouthPressLeft", "mouthPressRight",
-    "mouthPucker",
-    "mouthRight",
-    "mouthRollLower", "mouthRollUpper",
-    "mouthShrugLower", "mouthShrugUpper",
-    "mouthSmileLeft", "mouthSmileRight",
-    "mouthStretchLeft", "mouthStretchRight",
-    "mouthUpperUpLeft", "mouthUpperUpRight",
-    "noseSneerLeft", "noseSneerRight",
-]
+from protocol import (
+    ARKIT_BLENDSHAPE_NAMES,
+    BLENDSHAPE_COUNT,
+    EXPECTED_PACKET_SIZE,
+    HEADER_STRUCT,
+    POSE_LANDMARK_COUNT,
+    encode_packet,
+)
 
 
 def build_packet(blink_value: float = 0.0, smile_value: float = 0.0) -> bytes:
-    """Build a VPFR binary packet with controllable test values."""
-    data = bytearray(b'VPFR')
-    data += struct.pack('<d', time.time())
-
-    # 52 blendshapes
-    bs_values = [0.0] * 52
-    bs_values[ARKIT_NAMES.index("eyeBlinkLeft")] = blink_value
-    bs_values[ARKIT_NAMES.index("eyeBlinkRight")] = blink_value
-    bs_values[ARKIT_NAMES.index("mouthSmileLeft")] = smile_value
-    bs_values[ARKIT_NAMES.index("mouthSmileRight")] = smile_value
-
-    data += struct.pack('<H', 52)
-    for v in bs_values:
-        data += struct.pack('<f', v)
-
-    # 33 pose landmarks (simple T-pose mock)
-    data += struct.pack('<H', 33)
-    for i in range(33):
-        x = 0.5  # center
-        y = 0.1 + (i / 33.0) * 0.8  # spread vertically
-        z = 0.0
-        data += struct.pack('<fff', x, y, z)
-
-    return bytes(data)
+    """Build a VPTP schema-3 packet with controllable test values."""
+    blendshapes = {
+        "eyeBlinkLeft": blink_value,
+        "eyeBlinkRight": blink_value,
+        "mouthSmileLeft": smile_value,
+        "mouthSmileRight": smile_value,
+    }
+    pose = [
+        (0.5, 0.1 + (i / POSE_LANDMARK_COUNT) * 0.8, 0.0, 1.0, 1.0)
+        for i in range(POSE_LANDMARK_COUNT)
+    ]
+    return encode_packet(
+        frame_id=int(time.time() * 1000) & 0xFFFFFFFF,
+        timestamp=time.time(),
+        blendshapes=blendshapes,
+        face_rotation_matrix=(1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0),
+        pose_landmarks=pose,
+        face_tracked=True,
+        pose_tracked=True,
+    )
 
 
 def test_phase3():
@@ -80,7 +49,7 @@ def test_phase3():
     # Step 1: Packet format validation
     print("[1/3] Packet format validation...")
     pkt = build_packet(blink_value=0.8, smile_value=0.6)
-    expected_size = 4 + 8 + 2 + (52 * 4) + 2 + (33 * 3 * 4)
+    expected_size = EXPECTED_PACKET_SIZE
     actual_size = len(pkt)
     fmt_ok = actual_size == expected_size
     print(f"  Expected: {expected_size} bytes")
@@ -88,18 +57,18 @@ def test_phase3():
     print(f"  {'[PASS]' if fmt_ok else '[FAIL]'} Packet size")
 
     # Verify magic header
-    magic_ok = pkt[:4] == b'VPFR'
+    magic_ok = pkt[:4] == b'VPTP'
     print(f"  {'[PASS]' if magic_ok else '[FAIL]'} Magic header")
 
     # Verify blendshape count
-    bs_count = struct.unpack_from('<H', pkt, 12)[0]
-    bs_ok = bs_count == 52
+    bs_count = HEADER_STRUCT.unpack_from(pkt)[-1]
+    bs_ok = bs_count == BLENDSHAPE_COUNT
     print(f"  {'[PASS]' if bs_ok else '[FAIL]'} Blendshape count: {bs_count}")
 
     # Verify pose count
-    pose_offset = 12 + 2 + 52 * 4
-    pose_count = struct.unpack_from('<H', pkt, pose_offset)[0]
-    pose_ok = pose_count == 33
+    pose_offset = HEADER_STRUCT.size + BLENDSHAPE_COUNT * 4
+    pose_count = int.from_bytes(pkt[pose_offset:pose_offset + 2], "little")
+    pose_ok = pose_count == POSE_LANDMARK_COUNT
     print(f"  {'[PASS]' if pose_ok else '[FAIL]'} Pose landmark count: {pose_count}")
 
     # Step 2: Send test sequences to UE
@@ -172,6 +141,7 @@ def test_phase3():
         print(">>> Visual verification requires UE Play mode with avatar mesh.")
     else:
         print(">>> Some checks FAILED - review above")
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":

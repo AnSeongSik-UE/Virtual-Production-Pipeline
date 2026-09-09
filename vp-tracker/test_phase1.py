@@ -37,6 +37,7 @@ def test_tracking():
 
     if last:
         print(f"Blendshapes: {len(last.blendshapes)}")
+        print(f"Face rotation matrix values: {len(last.face_rotation_matrix)}")
         print(f"Pose landmarks: {len(last.pose_landmarks)}")
 
         if last.blendshapes:
@@ -47,15 +48,19 @@ def test_tracking():
         if last.pose_landmarks:
             print("\nSample pose landmarks (first 3):")
             labels = ["nose", "left_eye_inner", "left_eye"]
-            for i, (x, y, z) in enumerate(last.pose_landmarks[:3]):
+            for i, (x, y, z, visibility, presence) in enumerate(last.pose_landmarks[:3]):
                 label = labels[i] if i < len(labels) else f"landmark_{i}"
-                print(f"  {label}: ({x:.3f}, {y:.3f}, {z:.3f})")
+                print(
+                    f"  {label}: ({x:.3f}, {y:.3f}, {z:.3f}) "
+                    f"confidence=({visibility:.2f}, {presence:.2f})"
+                )
 
         # Verification checklist
         print("\n--- Checklist ---")
         checks = [
             ("Webcam capture", frames > 0),
             ("ARKit 52 blendshapes", len(last.blendshapes) == 52),
+            ("Face 3x3 rotation matrix", len(last.face_rotation_matrix) == 9),
             ("PoseLandmarker 33 landmarks", len(last.pose_landmarks) == 33),
             ("20fps+ inference", tracker.fps >= 20),
         ]
@@ -70,8 +75,10 @@ def test_tracking():
             print("\n>>> Phase 1 tracking verification PASSED!")
         else:
             print("\n>>> Some checks FAILED - review above")
+            raise SystemExit(1)
     else:
         print("[FAIL] No tracking data received")
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":

@@ -8,10 +8,9 @@ import time
 import sys
 import os
 import socket
-import threading
 
 
-class PipelineLauncher:
+class LegacyPipelineLauncher:
     def __init__(self):
         self.processes = {}
         self.base_dir = os.path.dirname(os.path.abspath(__file__))
@@ -21,17 +20,17 @@ class PipelineLauncher:
         """Pre-launch checks."""
         print("[Preflight]")
         checks = [
-            ("Webcam", self._check_webcam()),
-            ("UDP port 7000", self._check_port(7000)),
-            ("OBS WebSocket", self._check_obs()),
-            ("MediaPipe models", self._check_models()),
+            ("Webcam", self._check_webcam(), True),
+            ("MediaPipe models", self._check_models(), True),
+            ("Unreal UDP receiver", self._check_udp_listener(7000), False),
+            ("OBS WebSocket", self._check_obs(), False),
         ]
 
         all_ok = True
-        for name, (ok, msg) in checks:
-            status = "[OK]" if ok else "[FAIL]"
+        for name, (ok, msg), required in checks:
+            status = "[OK]" if ok else ("[FAIL]" if required else "[WARN]")
             print(f"  {status} {name}: {msg}")
-            if not ok:
+            if required and not ok:
                 all_ok = False
 
         return all_ok
@@ -126,7 +125,8 @@ class PipelineLauncher:
         if tracker and tracker.poll() is None:
             print(f"  [OK] Tracker: running (PID {tracker.pid})")
         else:
-            print("  [FAIL] Tracker: not running")
+            exit_code = tracker.returncode if tracker else "not started"
+            print(f"  [FAIL] Tracker: not running (exit={exit_code})")
 
         # OBS
         if self.obs_ctrl:
@@ -173,14 +173,14 @@ class PipelineLauncher:
         except ImportError:
             return (False, "OpenCV not installed")
 
-    def _check_port(self, port):
+    def _check_udp_listener(self, port):
+        """Best-effort check; UDP cannot prove which process owns the port."""
         try:
-            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            s.bind(("127.0.0.1", port))
-            s.close()
-            return (True, "Available")
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
+                probe.bind(("127.0.0.1", port))
+            return (False, "No listener detected; start Unreal PIE before tracking")
         except OSError:
-            return (False, "In use")
+            return (True, "Port is bound (likely Unreal PIE)")
 
     def _check_obs(self):
         try:
@@ -195,12 +195,19 @@ class PipelineLauncher:
 
     def _check_models(self):
         models_dir = os.path.join(self.base_dir, "models")
-        required = ["face_landmarker.task", "pose_landmarker_heavy.task"]
+        from tracker import POSE_MODEL_FILES, selected_pose_model
+
+        pose_model = selected_pose_model()
+        required = ["face_landmarker.task", POSE_MODEL_FILES[pose_model]]
         missing = [m for m in required if not os.path.exists(os.path.join(models_dir, m))]
         if not missing:
-            return (True, "All models found")
+            return (True, f"All models found (Pose={pose_model})")
         return (False, f"Missing: {', '.join(missing)}")
+
+from supervisor import PipelineSupervisor as PipelineLauncher
 
 
 if __name__ == "__main__":
-    PipelineLauncher().launch()
+    from supervisor import main as supervisor_main
+
+    sys.exit(supervisor_main())

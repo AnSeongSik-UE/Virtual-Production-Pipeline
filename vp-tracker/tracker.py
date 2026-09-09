@@ -1,21 +1,25 @@
-"""
-VP Pipeline - Unified Webcam Tracker
-MediaPipe Tasks API (FaceLandmarker + PoseLandmarker)를 동일 프레임에서 순차 실행
-"""
-import mediapipe as mp
-import cv2
-import time
+"""VP Pipeline asynchronous latest-only webcam tracker."""
+
+import os
 import threading
+import time
 from dataclasses import dataclass, field
+from pathlib import Path
+from queue import Empty, Queue
 from typing import Optional
-from queue import Queue, Empty
+
+import cv2
+import mediapipe as mp
 
 @dataclass
 class TrackingFrame:
     """하나의 프레임에서 추출된 전체 트래킹 데이터"""
     timestamp: float = 0.0
     blendshapes: dict[str, float] = field(default_factory=dict)      # ARKit 52 블렌드쉐이프
-    pose_landmarks: list[tuple[float, float, float]] = field(default_factory=list)  # 33개 (x, y, z)
+    face_rotation_matrix: tuple[float, ...] = field(default_factory=tuple)
+    pose_landmarks: list[tuple[float, float, float, float, float]] = field(default_factory=list)
+    face_tracked: bool = False
+    pose_tracked: bool = False
 
 BaseOptions = mp.tasks.BaseOptions
 FaceLandmarker = mp.tasks.vision.FaceLandmarker
@@ -24,157 +28,362 @@ PoseLandmarker = mp.tasks.vision.PoseLandmarker
 PoseLandmarkerOptions = mp.tasks.vision.PoseLandmarkerOptions
 VisionRunningMode = mp.tasks.vision.RunningMode
 
+POSE_MODEL_FILES = {
+    "full": "pose_landmarker_full.task",
+    "heavy": "pose_landmarker_heavy.task",
+}
+
+
+def selected_pose_model() -> str:
+    """Return the validated runtime pose quality profile."""
+    model = os.getenv("VP_POSE_MODEL", "full").strip().lower()
+    if model not in POSE_MODEL_FILES:
+        supported = ", ".join(sorted(POSE_MODEL_FILES))
+        raise ValueError(f"VP_POSE_MODEL must be one of: {supported}")
+    return model
+
 
 class UnifiedTracker:
-    """단일 웹캠에서 Face + Pose를 동시에 추론하는 통합 트래커"""
+    """Single-camera Face + Pose tracker with independent latest-only inference."""
 
-    def __init__(self, camera_id: int = 0):
+    def __init__(
+        self,
+        camera_id: int = 0,
+        capture_width: int = 1280,
+        capture_height: int = 720,
+        pose_width: int = 640,
+        pose_height: int = 360,
+        result_stale_ms: int = 250,
+    ):
         self.camera_id = camera_id
+        self.capture_width = capture_width
+        self.capture_height = capture_height
+        self.pose_width = pose_width
+        self.pose_height = pose_height
+        self.result_stale_ms = result_stale_ms
+
+        models_dir = Path(__file__).resolve().parent / "models"
+        self.pose_model_name = selected_pose_model()
+        self.face_model_path = models_dir / "face_landmarker.task"
+        self.pose_model_path = models_dir / POSE_MODEL_FILES[self.pose_model_name]
+
         self.data_queue: Queue[TrackingFrame] = Queue(maxsize=2)
         self.running = False
         self._thread: Optional[threading.Thread] = None
-        self._fps = 0.0
+        self._error: Optional[BaseException] = None
+        self._result_lock = threading.Lock()
+        self._capture_lock = threading.Lock()
+        self._capture: Optional[cv2.VideoCapture] = None
+        self._stop_event = threading.Event()
 
-        # FaceLandmarker 설정
-        self.face_options = FaceLandmarkerOptions(
-            base_options=BaseOptions(model_asset_path='models/face_landmarker.task'),
-            running_mode=VisionRunningMode.VIDEO,
-            output_face_blendshapes=True,
-            num_faces=1
-        )
+        self._latest_face_timestamp = -1
+        self._latest_face_blendshapes: dict[str, float] = {}
+        self._latest_face_rotation_matrix: tuple[float, ...] = ()
+        self._latest_face_tracked = False
+        self._latest_pose_timestamp = -1
+        self._latest_pose_landmarks: list[tuple[float, float, float, float, float]] = []
+        self._latest_pose_tracked = False
 
-        # PoseLandmarker 설정
-        self.pose_options = PoseLandmarkerOptions(
-            base_options=BaseOptions(model_asset_path='models/pose_landmarker_heavy.task'),
-            running_mode=VisionRunningMode.VIDEO,
-            num_poses=1
-        )
+        self._camera_fps = 0.0
+        self._face_fps = 0.0
+        self._pose_fps = 0.0
+        self._camera_count = 0
+        self._face_count = 0
+        self._pose_count = 0
+        self._metrics_started = time.monotonic()
 
     @property
     def fps(self) -> float:
-        return self._fps
+        """Effective Face+Pose callback rate retained for existing callers."""
+        rates = [rate for rate in (self._face_fps, self._pose_fps) if rate > 0.0]
+        return min(rates) if rates else 0.0
+
+    @property
+    def camera_fps(self) -> float:
+        return self._camera_fps
+
+    @property
+    def face_fps(self) -> float:
+        return self._face_fps
+
+    @property
+    def pose_fps(self) -> float:
+        return self._pose_fps
 
     def start(self):
-        """트래킹 시작"""
+        """Start webcam capture and asynchronous inference."""
+        if self.running:
+            return
+        self._validate_models()
+        self._error = None
+        self._stop_event.clear()
         self.running = True
         self._thread = threading.Thread(target=self._tracking_loop, daemon=True)
         self._thread.start()
 
-    def stop(self):
-        """트래킹 중지"""
+    def stop(self) -> bool:
+        """Stop inference, unblock capture if needed, and confirm thread exit."""
         self.running = False
-        if self._thread:
-            self._thread.join(timeout=5)
+        self._stop_event.set()
+        thread = self._thread
+        if not thread:
+            return True
+        thread.join(timeout=1.0)
+        if thread.is_alive():
+            with self._capture_lock:
+                capture = self._capture
+            if capture is not None:
+                capture.release()
+            thread.join(timeout=4.0)
+        stopped = not thread.is_alive()
+        if stopped:
+            self._thread = None
+        else:
+            print("[ERROR] Webcam tracking thread did not stop within 5 seconds")
+        return stopped
 
-    def _tracking_loop(self):
-        cap = cv2.VideoCapture(self.camera_id)
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
-
-        if not cap.isOpened():
-            print("[ERROR] Cannot open webcam")
-            return
-
-        actual_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        actual_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        print(f"[CAM] Webcam opened: {actual_w}x{actual_h}")
-
-        with FaceLandmarker.create_from_options(self.face_options) as face_lm, \
-             PoseLandmarker.create_from_options(self.pose_options) as pose_lm:
-
-            prev_time = time.time()
-            frame_count = 0
-
-            while self.running and cap.isOpened():
-                ret, frame = cap.read()
-                if not ret:
-                    continue
-
-                timestamp_ms = int(time.time() * 1000)
-                mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=frame)
-
-                # 순차 추론 (동일 프레임)
-                face_result = face_lm.detect_for_video(mp_image, timestamp_ms)
-                pose_result = pose_lm.detect_for_video(mp_image, timestamp_ms)
-
-                tracking_frame = self._build_tracking_frame(
-                    timestamp_ms, face_result, pose_result
-                )
-
-                # 큐가 가득 차면 오래된 데이터 버림 (최신 우선)
-                if self.data_queue.full():
-                    try:
-                        self.data_queue.get_nowait()
-                    except Empty:
-                        pass
-                self.data_queue.put(tracking_frame)
-
-                # FPS 계산
-                frame_count += 1
-                elapsed = time.time() - prev_time
-                if elapsed >= 1.0:
-                    self._fps = frame_count / elapsed
-                    frame_count = 0
-                    prev_time = time.time()
-
-        cap.release()
-        print("[CAM] Webcam released")
-
-    def _build_tracking_frame(self, timestamp, face_result, pose_result) -> TrackingFrame:
-        # 블렌드쉐이프 추출
-        blendshapes = {}
-        if face_result.face_blendshapes:
-            for bs in face_result.face_blendshapes[0]:
-                blendshapes[bs.category_name] = bs.score
-
-        # 포즈 랜드마크 추출
-        pose_landmarks = []
-        if pose_result.pose_landmarks:
-            for lm in pose_result.pose_landmarks[0]:
-                pose_landmarks.append((lm.x, lm.y, lm.z))
-
-        return TrackingFrame(
-            timestamp=timestamp,
-            blendshapes=blendshapes,
-            pose_landmarks=pose_landmarks
-        )
+    def raise_if_failed(self):
+        """Propagate worker/callback failures to the sender process."""
+        if self._error is not None:
+            raise RuntimeError("tracking worker failed") from self._error
 
     def get_latest(self) -> Optional[TrackingFrame]:
-        """최신 트래킹 데이터 반환 (없으면 None)"""
+        """Drain queued results and return only the newest frame."""
+        latest = None
+        while True:
+            try:
+                latest = self.data_queue.get_nowait()
+            except Empty:
+                return latest
+
+    def _validate_models(self):
+        missing = [
+            str(path)
+            for path in (self.face_model_path, self.pose_model_path)
+            if not path.is_file()
+        ]
+        if missing:
+            raise FileNotFoundError(
+                "Missing MediaPipe model(s): "
+                + ", ".join(missing)
+                + ". Run tools/mediapipe/Install-MediaPipeModels.ps1."
+            )
+
+    def _tracking_loop(self):
+        cap = None
         try:
-            return self.data_queue.get_nowait()
-        except Empty:
-            return None
+            cap = cv2.VideoCapture(self.camera_id)
+            with self._capture_lock:
+                self._capture = cap
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.capture_width)
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.capture_height)
+            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+            if not cap.isOpened():
+                raise RuntimeError("cannot open webcam")
+
+            actual_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            actual_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            print(
+                f"[CAM] Webcam opened: {actual_w}x{actual_h}; "
+                f"Pose={self.pose_model_name} {self.pose_width}x{self.pose_height}"
+            )
+
+            face_options = FaceLandmarkerOptions(
+                base_options=BaseOptions(model_asset_path=str(self.face_model_path)),
+                running_mode=VisionRunningMode.LIVE_STREAM,
+                output_face_blendshapes=True,
+                output_facial_transformation_matrixes=True,
+                num_faces=1,
+                result_callback=self._on_face_result,
+            )
+            pose_options = PoseLandmarkerOptions(
+                base_options=BaseOptions(model_asset_path=str(self.pose_model_path)),
+                running_mode=VisionRunningMode.LIVE_STREAM,
+                num_poses=1,
+                result_callback=self._on_pose_result,
+            )
+
+            with FaceLandmarker.create_from_options(face_options) as face_lm, \
+                    PoseLandmarker.create_from_options(pose_options) as pose_lm:
+                last_timestamp_ms = -1
+                consecutive_read_failures = 0
+                while self.running and not self._stop_event.is_set() and cap.isOpened():
+                    ret, frame = cap.read()
+                    if not ret:
+                        if self._stop_event.is_set():
+                            break
+                        consecutive_read_failures += 1
+                        if consecutive_read_failures >= 30:
+                            raise RuntimeError("webcam stopped returning frames")
+                        time.sleep(0.01)
+                        continue
+                    consecutive_read_failures = 0
+
+                    # QueryPerformanceCounter-backed on Windows. Unreal's
+                    # FPlatformTime uses the same monotonic clock, so the
+                    # existing millisecond packet timestamp can be compared
+                    # without changing the VPTP schema.
+                    timestamp_ms = _next_frame_timestamp_ms(
+                        last_timestamp_ms,
+                        time.perf_counter(),
+                    )
+                    last_timestamp_ms = timestamp_ms
+                    rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                    pose_rgb = cv2.resize(
+                        rgb_frame,
+                        (self.pose_width, self.pose_height),
+                        interpolation=cv2.INTER_AREA,
+                    )
+                    face_lm.detect_async(
+                        mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_frame),
+                        timestamp_ms,
+                    )
+                    pose_lm.detect_async(
+                        mp.Image(image_format=mp.ImageFormat.SRGB, data=pose_rgb),
+                        timestamp_ms,
+                    )
+                    with self._result_lock:
+                        self._camera_count += 1
+                        self._update_metrics_locked()
+        except BaseException as error:
+            self._error = error
+            self.running = False
+            self._stop_event.set()
+            print(f"[ERROR] Tracking worker failed: {error}")
+        finally:
+            with self._capture_lock:
+                if self._capture is cap:
+                    self._capture = None
+            if cap is not None:
+                cap.release()
+            print("[CAM] Webcam released")
+
+    def _on_face_result(self, result, _output_image, timestamp_ms: int):
+        try:
+            blendshapes = {}
+            face_rotation_matrix = ()
+            if result.face_blendshapes:
+                blendshapes = {
+                    item.category_name: item.score
+                    for item in result.face_blendshapes[0]
+                }
+            if result.facial_transformation_matrixes:
+                matrix = result.facial_transformation_matrixes[0]
+                if getattr(matrix, "shape", None) == (4, 4):
+                    face_rotation_matrix = tuple(
+                        float(matrix[row, column])
+                        for row in range(3)
+                        for column in range(3)
+                    )
+            with self._result_lock:
+                self._latest_face_timestamp = timestamp_ms
+                self._latest_face_blendshapes = blendshapes
+                self._latest_face_rotation_matrix = face_rotation_matrix
+                self._latest_face_tracked = bool(blendshapes) and len(face_rotation_matrix) == 9
+                self._face_count += 1
+                self._update_metrics_locked()
+        except BaseException as error:
+            self._error = error
+            self.running = False
+            self._stop_event.set()
+
+    def _on_pose_result(self, result, _output_image, timestamp_ms: int):
+        try:
+            pose_landmarks = []
+            if result.pose_landmarks:
+                pose_landmarks = [
+                    (
+                        landmark.x,
+                        landmark.y,
+                        landmark.z,
+                        float(getattr(landmark, "visibility", 0.0) or 0.0),
+                        float(getattr(landmark, "presence", 0.0) or 0.0),
+                    )
+                    for landmark in result.pose_landmarks[0]
+                ]
+            with self._result_lock:
+                self._latest_pose_timestamp = timestamp_ms
+                self._latest_pose_landmarks = pose_landmarks
+                self._latest_pose_tracked = bool(pose_landmarks)
+                self._pose_count += 1
+                self._update_metrics_locked()
+                self._publish_fused_locked(timestamp_ms)
+        except BaseException as error:
+            self._error = error
+            self.running = False
+            self._stop_event.set()
+
+    def _publish_fused_locked(self, timestamp_ms: int):
+        face_fresh = (
+            self._latest_face_timestamp >= 0
+            and timestamp_ms - self._latest_face_timestamp <= self.result_stale_ms
+        )
+        pose_fresh = (
+            self._latest_pose_timestamp >= 0
+            and timestamp_ms - self._latest_pose_timestamp <= self.result_stale_ms
+        )
+        tracking_frame = TrackingFrame(
+            timestamp=float(timestamp_ms),
+            blendshapes=dict(self._latest_face_blendshapes) if face_fresh else {},
+            face_rotation_matrix=(
+                self._latest_face_rotation_matrix
+                if face_fresh and self._latest_face_tracked
+                else ()
+            ),
+            pose_landmarks=list(self._latest_pose_landmarks) if pose_fresh else [],
+            face_tracked=face_fresh and self._latest_face_tracked,
+            pose_tracked=pose_fresh and self._latest_pose_tracked,
+        )
+        if self.data_queue.full():
+            try:
+                self.data_queue.get_nowait()
+            except Empty:
+                pass
+        self.data_queue.put_nowait(tracking_frame)
+
+    def _update_metrics_locked(self):
+        now = time.monotonic()
+        elapsed = now - self._metrics_started
+        if elapsed < 1.0:
+            return
+        self._camera_fps = self._camera_count / elapsed
+        self._face_fps = self._face_count / elapsed
+        self._pose_fps = self._pose_count / elapsed
+        self._camera_count = 0
+        self._face_count = 0
+        self._pose_count = 0
+        self._metrics_started = now
+
+
+def _next_frame_timestamp_ms(last_timestamp_ms: int, now_seconds: float) -> int:
+    """Return a strictly increasing millisecond timestamp for MediaPipe/VPTP."""
+    return max(int(now_seconds * 1000), last_timestamp_ms + 1)
 
 
 def main():
-    """트래커 단독 테스트 — 콘솔에 실시간 출력"""
+    """Run the tracker without Unreal and print live diagnostics."""
     tracker = UnifiedTracker(camera_id=0)
     tracker.start()
     print("[*] Tracking started (Ctrl+C to stop)")
 
     try:
         while True:
+            tracker.raise_if_failed()
             frame = tracker.get_latest()
             if frame:
                 bs_count = len(frame.blendshapes)
                 pose_count = len(frame.pose_landmarks)
 
-                # 대표 블렌드쉐이프 몇 개 출력
-                sample_bs = ""
-                if frame.blendshapes:
-                    items = list(frame.blendshapes.items())[:3]
-                    sample_bs = " | ".join(f"{k}={v:.2f}" for k, v in items)
-
                 print(
-                    f"\r[{tracker.fps:.1f}fps] "
-                    f"BS:{bs_count} Pose:{pose_count} "
-                    f"| {sample_bs}",
+                    f"\r[Cam:{tracker.camera_fps:.1f} "
+                    f"Face:{tracker.face_fps:.1f} Pose:{tracker.pose_fps:.1f}] "
+                    f"BS:{bs_count} Pose:{pose_count}",
                     end="", flush=True
                 )
             time.sleep(1/60)
     except KeyboardInterrupt:
         print("\n[*] Stopping...")
+    finally:
         tracker.stop()
         print("[OK] Tracking stopped")
 

@@ -15,9 +15,9 @@ code = """graph TD
 
     subgraph Tracking ["Tracking Layer (Python)"]
         Launcher["launcher.py (Preflight & Setup)"]:::python
-        Tracker["tracker.py (Unified Tracker)"]:::python
+        Tracker["tracker.py (BGR→RGB Unified Tracker)"]:::python
         MP_Face["MediaPipe FaceLandmarker (52 ARKit Blendshapes)"]:::python
-        MP_Pose["MediaPipe PoseLandmarker (33 Landmarks)"]:::python
+        MP_Pose["MediaPipe PoseLandmarker (33 Positions + Confidence)"]:::python
         Sender["sender.py (Binary UDP Sender)"]:::python
 
         Launcher -->|1. Starts| Tracker
@@ -29,22 +29,22 @@ code = """graph TD
     end
 
     subgraph Network ["Network Transport"]
-        UDP["UDP Protocol (Port 7000, 620B VPFR Packets)"]:::network
+        UDP["VPTP Schema 3 UDP (Port 7000, Fixed 928B)"]:::network
         Sender -->|Send Binary Data| UDP
     end
 
-    subgraph Unreal ["Rendering Layer (Unreal Engine 5.7)"]
+    subgraph Unreal ["Rendering Layer (Unreal Engine 5.8)"]
         UPlugin["VPTrackerReceiver (C++ Plugin)"]:::ue
-        UDPReceiver["VPUDPReceiver (SPSC Thread-Safe Queue)"]:::ue
+        UDPReceiver["VPUDPReceiver (Strict Parser + Bounded SPSC Queue)"]:::ue
         VPAnim["VPAnimInstance (C++ AnimInstance)"]:::ue
         DataTable["Face/Pose DataTable (ARKit to VRoid Map)"]:::ue
-        Avatar["VRoid Avatar (MorphTargets & Head IK)"]:::ue
+        Avatar["VRoid Avatar (MorphTargets, Head & Upper Arms)"]:::ue
 
         UDP -->|Listen| UDPReceiver
-        UDPReceiver -->|Parse & Map| UPlugin
+        UDPReceiver -->|Validate & Parse| UPlugin
         UPlugin -->|Update| VPAnim
         VPAnim -.->|Read Map| DataTable
-        VPAnim -->|Apply Transforms| Avatar
+        VPAnim -->|Apply Face / Head / Upper Arms| Avatar
     end
 
     subgraph Broadcasting ["Broadcasting Layer (OBS Studio)"]
@@ -69,8 +69,9 @@ print(f"Downloading from: {url}")
 req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
 try:
     with urllib.request.urlopen(req) as response:
-        with open('C:/UnrealWork/VP/vp_architecture.png', 'wb') as f:
+        output_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "vp_architecture.png"))
+        with open(output_path, 'wb') as f:
             f.write(response.read())
-    print("SUCCESS: C:/UnrealWork/VP/vp_architecture.png")
+    print(f"SUCCESS: {output_path}")
 except Exception as e:
     print(f"FAILED: {e}")

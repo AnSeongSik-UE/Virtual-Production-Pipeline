@@ -1,0 +1,28 @@
+#include "/Engine/Private/Common.ush"
+
+Texture2D AvatarTexture;
+SamplerState AvatarSampler;
+float2 InverseOutputSize;
+float4 BackgroundColor;
+float ExposureScale;
+uint RemoveBackground;
+
+float3 VPFilmicToneMap(float3 LinearColor)
+{
+	LinearColor = max(LinearColor * ExposureScale, 0.0f);
+	return saturate(
+		(LinearColor * (2.51f * LinearColor + 0.03f)) /
+		(LinearColor * (2.43f * LinearColor + 0.59f) + 0.14f));
+}
+
+void MainPS(float4 SvPosition : SV_POSITION, out float4 OutColor : SV_Target0)
+{
+	const float2 UV = SvPosition.xy * InverseOutputSize;
+	const float4 Captured = AvatarTexture.SampleLevel(AvatarSampler, UV, 0);
+	const float Opacity = 1.0f - saturate(Captured.a);
+	const float3 StraightAvatar = Captured.rgb / max(Opacity, 0.0001f);
+	const float3 TonedAvatar = VPFilmicToneMap(StraightAvatar);
+	OutColor = RemoveBackground != 0
+		? float4(TonedAvatar * Opacity, Opacity)
+		: float4(lerp(BackgroundColor.rgb, TonedAvatar, Opacity), 1.0f);
+}

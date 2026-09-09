@@ -85,13 +85,19 @@ VPPipeline/Plugins/**/Intermediate/
 VPPipeline/Plugins/**/Binaries/
 
 # Third-party UE plugins (large, install separately)
+VPPipeline/Plugins/VRM4U/
 VPPipeline/Plugins/VRM4U-master/
+VPPipeline/Plugins/Spout2_DX12/
 
 # Claude Code worktree
 .claude/
 
 # Secrets
 .env
+
+# Local project state and work history
+PROJECT_STATE.md
+taskReport.md
 
 # Python
 __pycache__/
