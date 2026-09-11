@@ -21,6 +21,16 @@ class TrackingFrame:
     face_tracked: bool = False
     pose_tracked: bool = False
 
+
+@dataclass
+class _CameraSwitchRequest:
+    camera_id: int
+    camera_backend: int
+    completed: threading.Event = field(default_factory=threading.Event)
+    cancelled: bool = False
+    success: bool = False
+    error: str = ""
+
 BaseOptions = mp.tasks.BaseOptions
 FaceLandmarker = mp.tasks.vision.FaceLandmarker
 FaceLandmarkerOptions = mp.tasks.vision.FaceLandmarkerOptions
@@ -49,6 +59,7 @@ class UnifiedTracker:
     def __init__(
         self,
         camera_id: int = 0,
+        camera_backend: int = cv2.CAP_ANY,
         capture_width: int = 1280,
         capture_height: int = 720,
         pose_width: int = 640,
@@ -56,6 +67,7 @@ class UnifiedTracker:
         result_stale_ms: int = 250,
     ):
         self.camera_id = camera_id
+        self.camera_backend = camera_backend
         self.capture_width = capture_width
         self.capture_height = capture_height
         self.pose_width = pose_width
@@ -74,7 +86,10 @@ class UnifiedTracker:
         self._result_lock = threading.Lock()
         self._capture_lock = threading.Lock()
         self._capture: Optional[cv2.VideoCapture] = None
+        self._camera_switch_lock = threading.Lock()
+        self._pending_camera_switch: _CameraSwitchRequest | None = None
         self._stop_event = threading.Event()
+        self._accept_results_after_timestamp = -1
 
         self._latest_face_timestamp = -1
         self._latest_face_blendshapes: dict[str, float] = {}
@@ -147,6 +162,31 @@ class UnifiedTracker:
         if self._error is not None:
             raise RuntimeError("tracking worker failed") from self._error
 
+    def switch_camera(
+        self,
+        camera_id: int,
+        camera_backend: int,
+        timeout: float = 5.0,
+    ) -> tuple[bool, str]:
+        """Replace only the capture device while retaining MediaPipe instances."""
+        if camera_id < 0 or camera_backend < 0:
+            return False, "invalid camera selection"
+        if not self.running or not self._thread or not self._thread.is_alive():
+            return False, "tracker is not running"
+        if self.camera_id == camera_id and self.camera_backend == camera_backend:
+            return True, "unchanged"
+
+        request = _CameraSwitchRequest(camera_id, camera_backend)
+        with self._camera_switch_lock:
+            if self._pending_camera_switch is not None:
+                return False, "another camera change is in progress"
+            self._pending_camera_switch = request
+
+        if not request.completed.wait(timeout=max(0.1, timeout)):
+            request.cancelled = True
+            return False, "camera change timed out"
+        return request.success, request.error
+
     def get_latest(self) -> Optional[TrackingFrame]:
         """Drain queued results and return only the newest frame."""
         latest = None
@@ -169,15 +209,88 @@ class UnifiedTracker:
                 + ". Run tools/mediapipe/Install-MediaPipeModels.ps1."
             )
 
+    def _open_camera_capture(
+        self,
+        camera_id: int,
+        camera_backend: int,
+    ) -> cv2.VideoCapture:
+        capture = cv2.VideoCapture(camera_id, camera_backend)
+        capture.set(cv2.CAP_PROP_FRAME_WIDTH, self.capture_width)
+        capture.set(cv2.CAP_PROP_FRAME_HEIGHT, self.capture_height)
+        capture.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        return capture
+
+    def _take_camera_switch_request(self) -> _CameraSwitchRequest | None:
+        with self._camera_switch_lock:
+            request = self._pending_camera_switch
+            self._pending_camera_switch = None
+            return request
+
+    def _replace_capture_if_requested(
+        self,
+        current_capture: cv2.VideoCapture,
+        last_timestamp_ms: int,
+    ) -> tuple[cv2.VideoCapture, object | None]:
+        request = self._take_camera_switch_request()
+        if request is None:
+            return current_capture, None
+
+        replacement = None
+        try:
+            replacement = self._open_camera_capture(
+                request.camera_id,
+                request.camera_backend,
+            )
+            if not replacement.isOpened():
+                raise RuntimeError("selected camera could not be opened")
+            ok, first_frame = replacement.read()
+            if not ok:
+                raise RuntimeError("selected camera did not return a frame")
+            if request.cancelled or self._stop_event.is_set():
+                raise RuntimeError("camera change was cancelled")
+
+            with self._capture_lock:
+                self._capture = replacement
+            current_capture.release()
+            self.camera_id = request.camera_id
+            self.camera_backend = request.camera_backend
+            self._clear_tracking_results(
+                max(last_timestamp_ms + 1, int(time.perf_counter() * 1000))
+            )
+            request.success = True
+            request.error = "changed"
+            print(f"[CAM] Input changed: index={self.camera_id} backend={self.camera_backend}")
+            return replacement, first_frame
+        except Exception as exc:
+            if replacement is not None:
+                replacement.release()
+            request.error = str(exc)
+            return current_capture, None
+        finally:
+            request.completed.set()
+
+    def _clear_tracking_results(self, accept_after_timestamp: int) -> None:
+        with self._result_lock:
+            self._latest_face_timestamp = -1
+            self._latest_face_blendshapes = {}
+            self._latest_face_rotation_matrix = ()
+            self._latest_face_tracked = False
+            self._latest_pose_timestamp = -1
+            self._latest_pose_landmarks = []
+            self._latest_pose_tracked = False
+            self._accept_results_after_timestamp = accept_after_timestamp
+        while True:
+            try:
+                self.data_queue.get_nowait()
+            except Empty:
+                break
+
     def _tracking_loop(self):
         cap = None
         try:
-            cap = cv2.VideoCapture(self.camera_id)
+            cap = self._open_camera_capture(self.camera_id, self.camera_backend)
             with self._capture_lock:
                 self._capture = cap
-            cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.capture_width)
-            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.capture_height)
-            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
             if not cap.isOpened():
                 raise RuntimeError("cannot open webcam")
 
@@ -208,7 +321,14 @@ class UnifiedTracker:
                 last_timestamp_ms = -1
                 consecutive_read_failures = 0
                 while self.running and not self._stop_event.is_set() and cap.isOpened():
-                    ret, frame = cap.read()
+                    cap, switched_frame = self._replace_capture_if_requested(
+                        cap,
+                        last_timestamp_ms,
+                    )
+                    if switched_frame is None:
+                        ret, frame = cap.read()
+                    else:
+                        ret, frame = True, switched_frame
                     if not ret:
                         if self._stop_event.is_set():
                             break
@@ -251,6 +371,10 @@ class UnifiedTracker:
             self._stop_event.set()
             print(f"[ERROR] Tracking worker failed: {error}")
         finally:
+            pending_request = self._take_camera_switch_request()
+            if pending_request is not None:
+                pending_request.error = "tracker stopped before camera change"
+                pending_request.completed.set()
             with self._capture_lock:
                 if self._capture is cap:
                     self._capture = None
@@ -260,6 +384,8 @@ class UnifiedTracker:
 
     def _on_face_result(self, result, _output_image, timestamp_ms: int):
         try:
+            if timestamp_ms < self._accept_results_after_timestamp:
+                return
             blendshapes = {}
             face_rotation_matrix = ()
             if result.face_blendshapes:
@@ -289,6 +415,8 @@ class UnifiedTracker:
 
     def _on_pose_result(self, result, _output_image, timestamp_ms: int):
         try:
+            if timestamp_ms < self._accept_results_after_timestamp:
+                return
             pose_landmarks = []
             if result.pose_landmarks:
                 pose_landmarks = [

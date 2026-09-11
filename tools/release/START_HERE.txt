@@ -1,0 +1,30 @@
+Virtual Production Pipeline - 시작 안내
+========================================
+
+1. 이 폴더 전체를 원하는 위치에 복사하거나 압축 해제합니다.
+   VirtualProductionPipeline.exe만 따로 옮기면 실행되지 않습니다.
+
+2. 웹캠을 연결한 뒤 VirtualProductionPipeline.exe를 더블클릭합니다.
+   CMD 창은 열리지 않으며 Unreal 운영 화면만 표시됩니다.
+
+3. 앱은 기본 아바타 없이 시작할 수 있습니다.
+   좌측의 "VRM 추가" 버튼 또는 .vrm 드래그앤드롭으로 아바타를 등록합니다.
+
+4. 트래킹 팔레트의 "입력 카메라"에서 사용할 웹캠을 선택합니다.
+   선택은 다음 실행에도 유지되며 새 장치는 "새로고침"으로 반영합니다.
+   카메라 변경에 실패하면 기존 카메라를 계속 사용합니다.
+
+5. OBS 연동은 선택 사항입니다.
+   OBS와 OBS Spout2 플러그인을 설치하고 "Spout2 Capture" 소스를 추가합니다.
+   송신자는 "Virtual Production Pipeline", 합성 모드는 "Premultiplied Alpha"를 선택합니다.
+   앱은 OBS WebSocket, 비밀번호 또는 OBS 자동 제어를 사용하지 않습니다.
+   사용자가 등록한 .vrm은 배포본에 포함되어 있지 않습니다.
+
+6. 방송 팔레트에서 배경 모드·색·아바타 밝기·앱/Spout FPS를 조절합니다.
+   방송·녹화 시작과 OBS 영상 FPS는 OBS에서 직접 설정합니다.
+
+7. 앱 창을 닫으면 트래커도 종료되고 웹캠이 해제됩니다.
+   실행 오류 로그: %LOCALAPPDATA%\VirtualProductionPipeline\Logs
+
+Microsoft Visual C++ 런타임 오류가 발생하면 다음 파일을 실행합니다.
+Runtime\Engine\Extras\Redist\en-us\vc_redist.x64.exe

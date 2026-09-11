@@ -131,7 +131,7 @@ void UVPUDPReceiver::BeginPlay()
 	LastStatisticsLogPacketCount = 0;
 
 	// Create UDP socket
-	FIPv4Endpoint Endpoint(FIPv4Address(0, 0, 0, 0), ListenPort);
+	FIPv4Endpoint Endpoint(FIPv4Address(127, 0, 0, 1), ListenPort);
 
 	Socket = FUdpSocketBuilder(TEXT("VPTrackerSocket"))
 		.AsNonBlocking()
@@ -146,7 +146,7 @@ void UVPUDPReceiver::BeginPlay()
 		return;
 	}
 
-	UE_LOG(LogTemp, Log, TEXT("[VPUDPReceiver] Listening on port %d"), ListenPort);
+	UE_LOG(LogTemp, Log, TEXT("[VPUDPReceiver] Listening on 127.0.0.1:%d"), ListenPort);
 
 	// Start async receiver on dedicated thread
 	UDPReceiver = new FUdpSocketReceiver(

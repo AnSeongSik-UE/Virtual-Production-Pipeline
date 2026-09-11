@@ -71,6 +71,8 @@ public:
 		bool bPoseTracked,
 		bool bLeftArmTracked,
 		bool bRightArmTracked);
+	static float CalculatePacketRate(int32 PacketDelta, double ElapsedSeconds);
+	static bool ShouldRestartPacketRateSample(double UpdateGapSeconds);
 	static bool ShouldShowGuidancePanel(
 		EVPCalibrationState CalibrationState,
 		EVPArmValidationStage ValidationStage,
@@ -100,6 +102,9 @@ private:
 	TObjectPtr<UComboBoxString> AvatarSelector;
 
 	UPROPERTY(Transient)
+	TObjectPtr<UComboBoxString> InputCameraSelector;
+
+	UPROPERTY(Transient)
 	UTextBlock* AvatarStatusText = nullptr;
 
 	UPROPERTY(Transient)
@@ -119,6 +124,9 @@ private:
 
 	UPROPERTY(Transient)
 	UTextBlock* CalibrationStatusText = nullptr;
+
+	UPROPERTY(Transient)
+	UTextBlock* InputCameraStatusText = nullptr;
 
 	UPROPERTY(Transient)
 	UTextBlock* BroadcastStatusText = nullptr;
@@ -164,9 +172,6 @@ private:
 
 	UPROPERTY(Transient)
 	UTextBlock* OutputFPSValueText = nullptr;
-
-	UPROPERTY(Transient)
-	UTextBlock* ObsFPSStatusText = nullptr;
 
 	UPROPERTY(Transient)
 	TObjectPtr<UBorder> BackgroundColorSwatch;
@@ -220,17 +225,21 @@ private:
 	TObjectPtr<UButton> ModalSecondaryButton;
 
 	float TargetSearchElapsedSeconds = 0.0f;
-	float PacketRateWindowElapsedSeconds = 0.0f;
 	float SecondsSinceLastPacket = 0.0f;
 	float DisplayedPacketRate = 0.0f;
+	double PacketRateWindowStartTimeSeconds = 0.0;
+	double LastPacketRateUpdateTimeSeconds = 0.0;
+	double LastPacketObservedTimeSeconds = 0.0;
 	int32 LastObservedPacketCount = INDEX_NONE;
 	int32 PacketRateWindowStartCount = 0;
 	int32 ObservedAvatarLibraryRevision = INDEX_NONE;
 	int32 ObservedAvatarNoticeRevision = 0;
-	int32 ObservedObsFPSNoticeRevision = 0;
+	int32 ObservedInputCameraListRevision = INDEX_NONE;
+	int32 ObservedInputCameraNoticeRevision = 0;
 	bool bPacketRateReady = false;
 	bool bDeleteConfirmationModal = false;
 	bool bPanningCamera = false;
+	bool bOrbitingCamera = false;
 	bool bTrackingSettingsPaletteActive = false;
 	bool bUpdatingBackgroundColorControls = false;
 	bool bBackgroundColorCommitPending = false;
@@ -247,12 +256,13 @@ private:
 	EVPArmValidationStage PreviousValidationStage = EVPArmValidationStage::Idle;
 	FVector2D LastCameraPointerPosition = FVector2D::ZeroVector;
 	TMap<FString, FString> AvatarOptionToId;
+	TMap<FString, FString> InputCameraOptionToId;
 	UPROPERTY(Transient)
 	TArray<TObjectPtr<UWidget>> AvatarRequiredControls;
 
 	void BuildLayout();
 	void FindTrackingTargets();
-	void UpdatePacketRate(float DeltaSeconds);
+	void UpdatePacketRate();
 	void UpdateGuidanceVisibility(float DeltaSeconds);
 	void UpdateBackgroundColorCommit(float DeltaSeconds);
 	void UpdateAvatarExposureCommit(float DeltaSeconds);
@@ -262,6 +272,7 @@ private:
 	void RefreshOutputFPSControl(int32 FramesPerSecond);
 	void RefreshDashboard();
 	void RefreshAvatarSelector();
+	void RefreshInputCameraSelector();
 	void SetDashboardEnabled(bool bEnabled);
 	void SetTrackingSettingsPaletteActive(bool bActive);
 	void ShowNoticeModal(
@@ -329,6 +340,12 @@ private:
 
 	UFUNCTION()
 	void HandleOutputFPSChanged(float Value);
+
+	UFUNCTION()
+	void HandleInputCameraSelectionChanged(FString SelectedItem, ESelectInfo::Type SelectionType);
+
+	UFUNCTION()
+	void HandleRefreshInputCamerasClicked();
 
 	UFUNCTION()
 	void HandleAddAvatarClicked();

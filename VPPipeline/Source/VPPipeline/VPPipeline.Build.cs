@@ -30,6 +30,15 @@ public class VPPipeline : ModuleRules
 			"RenderCore"
 		});
 		
+		if (Target.Platform == UnrealTargetPlatform.Win64)
+		{
+			PublicSystemLibraries.AddRange(new string[] {
+				"Ole32.lib",
+				"Shell32.lib",
+				"Uuid.lib"
+			});
+		}
+
 		// Uncomment if you are using online features
 		// PrivateDependencyModuleNames.Add("OnlineSubsystem");
 

@@ -3,6 +3,7 @@
 #include "Algo/AllOf.h"
 #include "SpoutSenderComponent.h"
 #include "VPBroadcastRenderer.h"
+#include "VPAvatarManager.h"
 #include "VPAnimInstance.h"
 #include "Components/SceneCaptureComponent2D.h"
 #include "Components/SceneComponent.h"
@@ -29,6 +30,7 @@ namespace
 {
 const TCHAR* BroadcastSettingsSlot = TEXT("VPBroadcastSettings");
 constexpr int32 BroadcastSettingsUserIndex = 0;
+constexpr float DefaultAvatarKeyLightIntensity = 5.0f;
 }
 
 AVPBroadcastOutput::AVPBroadcastOutput()
@@ -56,7 +58,7 @@ AVPBroadcastOutput::AVPBroadcastOutput()
 	AvatarKeyLight = CreateDefaultSubobject<UDirectionalLightComponent>(TEXT("AvatarKeyLight"));
 	AvatarKeyLight->SetupAttachment(CaptureComponent);
 	AvatarKeyLight->SetMobility(EComponentMobility::Movable);
-	AvatarKeyLight->SetIntensity(1.0f);
+	AvatarKeyLight->SetIntensity(DefaultAvatarKeyLightIntensity);
 	AvatarKeyLight->SetLightColor(FLinearColor::White);
 	AvatarKeyLight->SetCastShadows(false);
 	AvatarKeyLight->SetAffectReflection(false);
@@ -82,6 +84,39 @@ FTransform AVPBroadcastOutput::CalculateInitialCameraTransform(
 
 	const FVector CameraLocation = BoundsOrigin - ViewDirection * CameraDistance;
 	return FTransform(ViewDirection.Rotation(), CameraLocation);
+}
+
+FTransform AVPBroadcastOutput::CalculateOrbitCameraTransform(
+	const FTransform& CameraTransform,
+	const FVector& OrbitPivot,
+	const FVector2D& ScreenDelta)
+{
+	const FVector CameraLocation = CameraTransform.GetLocation();
+	const float CameraDistance = FVector::Distance(CameraLocation, OrbitPivot);
+	if (!FMath::IsFinite(CameraDistance) || CameraDistance < 1.0f ||
+		CameraTransform.ContainsNaN() || OrbitPivot.ContainsNaN())
+	{
+		return CameraTransform;
+	}
+
+	FVector ViewDirection = (OrbitPivot - CameraLocation).GetSafeNormal();
+	if (ViewDirection.IsNearlyZero())
+	{
+		ViewDirection = CameraTransform.GetRotation().GetForwardVector();
+	}
+	FRotator ViewRotation = ViewDirection.Rotation();
+	ViewRotation.Yaw = FRotator::NormalizeAxis(ViewRotation.Yaw - ScreenDelta.X * 0.25f);
+	ViewRotation.Pitch = FMath::Clamp(ViewRotation.Pitch + ScreenDelta.Y * 0.20f, -60.0f, 60.0f);
+	ViewRotation.Roll = 0.0f;
+	const FVector NewLocation = OrbitPivot - ViewRotation.Vector() * CameraDistance;
+	return FTransform(ViewRotation, NewLocation);
+}
+
+FRotator AVPBroadcastOutput::GetAvatarFrontCameraRotation()
+{
+	// VRM4U normalizes runtime-loaded VRM avatars to face world +Y. The camera
+	// therefore looks toward -Y from the front of the avatar.
+	return FRotator(0.0f, -90.0f, 0.0f);
 }
 
 FVector AVPBroadcastOutput::CalculateBodyCenteredFramingOrigin(
@@ -113,13 +148,13 @@ void AVPBroadcastOutput::BeginPlay()
 	ISocketSubsystem* SocketSubsystem = ISocketSubsystem::Get(PLATFORM_SOCKETSUBSYSTEM);
 	if (SocketSubsystem)
 	{
-		ObsControlSocket = SocketSubsystem->CreateSocket(
+		ControlSocket = SocketSubsystem->CreateSocket(
 			NAME_DGram,
-			TEXT("VP OBS background control"),
+			TEXT("VP camera and lifecycle control"),
 			false);
-		if (ObsControlSocket)
+		if (ControlSocket)
 		{
-			ObsControlSocket->SetNonBlocking(true);
+			ControlSocket->SetNonBlocking(true);
 		}
 	}
 	FString ParsedSessionToken;
@@ -157,8 +192,7 @@ void AVPBroadcastOutput::BeginPlay()
 			*SpoutSenderName, OutputWidth, OutputHeight, OutputFramesPerSecond);
 	}
 
-	SendObsBackgroundCommand();
-	SendObsFPSCommand();
+	RequestInputCameraList();
 }
 
 void AVPBroadcastOutput::EndPlay(const EEndPlayReason::Type EndPlayReason)
@@ -176,13 +210,13 @@ void AVPBroadcastOutput::EndPlay(const EEndPlayReason::Type EndPlayReason)
 	}
 	bSpoutStartRequested = false;
 
-	if (ObsControlSocket)
+	if (ControlSocket)
 	{
 		if (ISocketSubsystem* SocketSubsystem = ISocketSubsystem::Get(PLATFORM_SOCKETSUBSYSTEM))
 		{
-			SocketSubsystem->DestroySocket(ObsControlSocket);
+			SocketSubsystem->DestroySocket(ControlSocket);
 		}
-		ObsControlSocket = nullptr;
+		ControlSocket = nullptr;
 	}
 
 	Super::EndPlay(EndPlayReason);
@@ -191,8 +225,14 @@ void AVPBroadcastOutput::EndPlay(const EEndPlayReason::Type EndPlayReason)
 void AVPBroadcastOutput::Tick(float DeltaSeconds)
 {
 	Super::Tick(DeltaSeconds);
-	PollObsControlResponses();
+	PollControlResponses();
 	const double NowSeconds = FPlatformTime::Seconds();
+	if (!bInputCameraListReceived &&
+		(LastInputCameraListRequestSeconds < 0.0 ||
+			NowSeconds - LastInputCameraListRequestSeconds >= 2.0))
+	{
+		RequestInputCameraList();
+	}
 	if (!LifecycleSessionToken.IsEmpty() &&
 		NowSeconds - LastLifecycleHeartbeatSeconds >= LifecycleHeartbeatIntervalSeconds)
 	{
@@ -269,6 +309,7 @@ void AVPBroadcastOutput::SetCapturedAvatar(AActor* AvatarActor, const FString& A
 	SaveCameraForActiveAvatar();
 	CapturedAvatar = AvatarActor;
 	ActiveAvatarId = AvatarId;
+	bCameraOrbitPivotValid = false;
 	CaptureComponent->ClearShowOnlyComponents();
 	CaptureComponent->ShowOnlyActorComponents(AvatarActor, true);
 	bInitialCameraFramed = RestoreCameraForActiveAvatar();
@@ -286,6 +327,7 @@ void AVPBroadcastOutput::ClearCapturedAvatar()
 	SaveCameraForActiveAvatar();
 	CapturedAvatar.Reset();
 	ActiveAvatarId.Reset();
+	bCameraOrbitPivotValid = false;
 	bInitialCameraFramed = false;
 	if (CaptureComponent)
 	{
@@ -300,24 +342,33 @@ void AVPBroadcastOutput::FrameAvatarForInitialView()
 		return;
 	}
 
-	FVector BoundsOrigin;
-	FVector BoundsExtent;
-	CapturedAvatar->GetActorBounds(false, BoundsOrigin, BoundsExtent, true);
+	FVector BoundsOrigin = FVector::ZeroVector;
+	FVector BoundsExtent = FVector::ZeroVector;
+	bool bUsingHumanoidBounds = false;
+	if (const AVPAvatarManager* AvatarManager = Cast<AVPAvatarManager>(CapturedAvatar.Get()))
+	{
+		FBox HumanoidBounds;
+		if (AvatarManager->TryGetHumanoidFramingBounds(HumanoidBounds))
+		{
+			BoundsOrigin = HumanoidBounds.GetCenter();
+			BoundsExtent = HumanoidBounds.GetExtent();
+			bUsingHumanoidBounds = true;
+		}
+	}
+	if (!bUsingHumanoidBounds)
+	{
+		CapturedAvatar->GetActorBounds(false, BoundsOrigin, BoundsExtent, true);
+	}
 	if (BoundsExtent.IsNearlyZero())
 	{
 		return;
 	}
 
-	FRotator ReferenceCameraRotation = FRotator::ZeroRotator;
-	APlayerCameraManager* CameraManager = UGameplayStatics::GetPlayerCameraManager(this, 0);
-	if (CameraManager)
-	{
-		ReferenceCameraRotation = CameraManager->GetCameraRotation();
-	}
+	const FRotator ReferenceCameraRotation = GetAvatarFrontCameraRotation();
 
 	FVector FramingOrigin = BoundsOrigin;
 	FVector BodyAnchor;
-	if (TryGetBodyFramingAnchor(BodyAnchor))
+	if (!bUsingHumanoidBounds && TryGetBodyFramingAnchor(BodyAnchor))
 	{
 		FramingOrigin = CalculateBodyCenteredFramingOrigin(
 			BoundsOrigin,
@@ -327,11 +378,15 @@ void AVPBroadcastOutput::FrameAvatarForInitialView()
 
 	constexpr float HorizontalFOVDegrees = 40.0f;
 	constexpr float AspectRatio = static_cast<float>(OutputWidth) / static_cast<float>(OutputHeight);
-	constexpr float Padding = 1.18f;
+	const float Padding = bUsingHumanoidBounds ? 1.08f : 1.18f;
 	const float HorizontalHalfAngle = FMath::DegreesToRadians(HorizontalFOVDegrees * 0.5f);
 	const float VerticalHalfAngle = FMath::Atan(FMath::Tan(HorizontalHalfAngle) / AspectRatio);
-	const float HorizontalCenterOffset = FVector::Dist2D(BoundsOrigin, FramingOrigin);
-	const float HorizontalExtent = FMath::Max(BoundsExtent.X, BoundsExtent.Y) + HorizontalCenterOffset;
+	const float HorizontalCenterOffset = bUsingHumanoidBounds
+		? 0.0f
+		: FVector::Dist2D(BoundsOrigin, FramingOrigin);
+	const float HorizontalExtent = (bUsingHumanoidBounds
+		? BoundsExtent.X
+		: FMath::Max(BoundsExtent.X, BoundsExtent.Y)) + HorizontalCenterOffset;
 	const float HorizontalDistance = HorizontalExtent / FMath::Max(0.01f, FMath::Tan(HorizontalHalfAngle));
 	const float VerticalDistance = BoundsExtent.Z / FMath::Max(0.01f, FMath::Tan(VerticalHalfAngle));
 	const float CameraDistance = FMath::Max(100.0f, FMath::Max(HorizontalDistance, VerticalDistance) * Padding);
@@ -342,13 +397,17 @@ void AVPBroadcastOutput::FrameAvatarForInitialView()
 
 	CaptureComponent->SetWorldLocationAndRotation(CameraTransform.GetLocation(), CameraTransform.Rotator());
 	CaptureComponent->FOVAngle = HorizontalFOVDegrees;
+	CameraOrbitPivot = FramingOrigin;
+	bCameraOrbitPivotValid = true;
 	bInitialCameraFramed = true;
 	UE_LOG(LogTemp, Log,
-		TEXT("[VPBroadcast] Initial full-body camera framed. BoundsOrigin=%s FramingOrigin=%s Extent=%s Distance=%.1f FOV=%.1f"),
+		TEXT("[VPBroadcast] Front full-body camera framed. Source=%s BoundsOrigin=%s FramingOrigin=%s Extent=%s Distance=%.1f Rotation=%s FOV=%.1f"),
+		bUsingHumanoidBounds ? TEXT("Humanoid") : TEXT("Actor"),
 		*BoundsOrigin.ToCompactString(),
 		*FramingOrigin.ToCompactString(),
 		*BoundsExtent.ToCompactString(),
 		CameraDistance,
+		*CameraTransform.Rotator().ToCompactString(),
 		HorizontalFOVDegrees);
 }
 
@@ -384,6 +443,49 @@ bool AVPBroadcastOutput::TryGetBodyFramingAnchor(FVector& OutAnchor) const
 	return false;
 }
 
+bool AVPBroadcastOutput::RestoreOrDeriveCameraOrbitPivot(
+	const FVPAvatarCameraSettings& Settings)
+{
+	if (!CapturedAvatar.IsValid())
+	{
+		return false;
+	}
+	if (Settings.bHasOrbitPivot && !Settings.RelativeOrbitPivot.ContainsNaN())
+	{
+		CameraOrbitPivot = CapturedAvatar->GetActorTransform().TransformPosition(
+			Settings.RelativeOrbitPivot);
+		bCameraOrbitPivotValid = !CameraOrbitPivot.ContainsNaN();
+		if (bCameraOrbitPivotValid)
+		{
+			return true;
+		}
+	}
+	bCameraOrbitPivotValid = DeriveCameraOrbitPivot(CameraOrbitPivot);
+	return bCameraOrbitPivotValid;
+}
+
+bool AVPBroadcastOutput::DeriveCameraOrbitPivot(FVector& OutPivot) const
+{
+	if (!CaptureComponent || !CapturedAvatar.IsValid())
+	{
+		return false;
+	}
+
+	FVector AvatarAnchor;
+	if (!TryGetBodyFramingAnchor(AvatarAnchor))
+	{
+		FVector BoundsExtent;
+		CapturedAvatar->GetActorBounds(false, AvatarAnchor, BoundsExtent, true);
+	}
+	const FVector CameraLocation = CaptureComponent->GetComponentLocation();
+	const FVector CameraForward = CaptureComponent->GetForwardVector().GetSafeNormal();
+	const float AnchorDepth = FVector::DotProduct(AvatarAnchor - CameraLocation, CameraForward);
+	OutPivot = AnchorDepth > 1.0f
+		? CameraLocation + CameraForward * AnchorDepth
+		: AvatarAnchor;
+	return !OutPivot.ContainsNaN();
+}
+
 bool AVPBroadcastOutput::RestoreCameraForActiveAvatar()
 {
 	if (!CaptureComponent || !CapturedAvatar.IsValid() || ActiveAvatarId.IsEmpty())
@@ -402,6 +504,7 @@ bool AVPBroadcastOutput::RestoreCameraForActiveAvatar()
 	CaptureComponent->SetWorldTransform(
 		Settings->RelativeTransform * CapturedAvatar->GetActorTransform());
 	CaptureComponent->FOVAngle = Settings->FieldOfView;
+	RestoreOrDeriveCameraOrbitPivot(*Settings);
 	UE_LOG(LogTemp, Log, TEXT("[VPBroadcast] Restored camera for avatar %s."), *ActiveAvatarId);
 	return true;
 }
@@ -417,6 +520,14 @@ void AVPBroadcastOutput::SaveCameraForActiveAvatar()
 	Settings.RelativeTransform = CaptureComponent->GetComponentTransform().GetRelativeTransform(
 		CapturedAvatar->GetActorTransform());
 	Settings.FieldOfView = CaptureComponent->FOVAngle;
+	if (!bCameraOrbitPivotValid)
+	{
+		bCameraOrbitPivotValid = DeriveCameraOrbitPivot(CameraOrbitPivot);
+	}
+	Settings.bHasOrbitPivot = bCameraOrbitPivotValid;
+	Settings.RelativeOrbitPivot = bCameraOrbitPivotValid
+		? CapturedAvatar->GetActorTransform().InverseTransformPosition(CameraOrbitPivot)
+		: FVector::ZeroVector;
 	SaveSettings();
 }
 
@@ -429,7 +540,40 @@ void AVPBroadcastOutput::PanCamera(const FVector2D& ScreenDelta)
 	constexpr float UnitsPerPixel = 0.22f;
 	const FVector Offset = CaptureComponent->GetRightVector() * (-ScreenDelta.X * UnitsPerPixel) +
 		CaptureComponent->GetUpVector() * (ScreenDelta.Y * UnitsPerPixel);
+	if (!bCameraOrbitPivotValid)
+	{
+		bCameraOrbitPivotValid = DeriveCameraOrbitPivot(CameraOrbitPivot);
+	}
 	CaptureComponent->AddWorldOffset(Offset);
+	if (bCameraOrbitPivotValid)
+	{
+		CameraOrbitPivot += Offset;
+	}
+	SaveCameraForActiveAvatar();
+}
+
+void AVPBroadcastOutput::OrbitCamera(const FVector2D& ScreenDelta)
+{
+	if (!CaptureComponent || !CapturedAvatar.IsValid() || ScreenDelta.IsNearlyZero())
+	{
+		return;
+	}
+	if (!bCameraOrbitPivotValid)
+	{
+		bCameraOrbitPivotValid = DeriveCameraOrbitPivot(CameraOrbitPivot);
+	}
+	if (!bCameraOrbitPivotValid)
+	{
+		return;
+	}
+
+	const FTransform OrbitTransform = CalculateOrbitCameraTransform(
+		CaptureComponent->GetComponentTransform(),
+		CameraOrbitPivot,
+		ScreenDelta);
+	CaptureComponent->SetWorldLocationAndRotation(
+		OrbitTransform.GetLocation(),
+		OrbitTransform.Rotator());
 	SaveCameraForActiveAvatar();
 }
 
@@ -453,6 +597,7 @@ void AVPBroadcastOutput::ResetCameraToFullBody()
 		return;
 	}
 	AvatarCameraSettings.Remove(ActiveAvatarId);
+	bCameraOrbitPivotValid = false;
 	bInitialCameraFramed = false;
 	FrameAvatarForInitialView();
 	SaveCameraForActiveAvatar();
@@ -501,7 +646,6 @@ void AVPBroadcastOutput::SetBackgroundMode(EVPBroadcastBackgroundMode NewMode)
 	BackgroundMode = NewMode;
 	ApplyBackgroundColor();
 	SaveSettings();
-	SendObsBackgroundCommand();
 }
 
 void AVPBroadcastOutput::SetBackgroundColor(const FLinearColor& NewColor)
@@ -615,7 +759,32 @@ void AVPBroadcastOutput::PreviewOutputFPS(int32 NewFPS)
 void AVPBroadcastOutput::CommitOutputFPS()
 {
 	SaveSettings();
-	SendObsFPSCommand();
+}
+
+void AVPBroadcastOutput::RequestInputCameraList()
+{
+	InputCameraStatusText = InputCameraDevices.IsEmpty()
+		? TEXT("입력 카메라 확인 중")
+		: InputCameraStatusText;
+	LastInputCameraListRequestSeconds = FPlatformTime::Seconds();
+	SendInputCameraCommand(TEXT("list"));
+}
+
+void AVPBroadcastOutput::SelectInputCamera(const FString& DeviceId)
+{
+	const FVPInputCameraDevice* Selected = InputCameraDevices.FindByPredicate(
+		[&DeviceId](const FVPInputCameraDevice& Device)
+		{
+			return Device.Id == DeviceId;
+		});
+	if (!Selected || DeviceId == ActiveInputCameraId)
+	{
+		return;
+	}
+	InputCameraStatusText = FString::Printf(
+		TEXT("입력 카메라 변경 중 · %s"),
+		*Selected->DisplayName);
+	SendInputCameraCommand(TEXT("select"), DeviceId);
 }
 
 FString AVPBroadcastOutput::GetBackgroundColorHex() const
@@ -699,48 +868,37 @@ bool AVPBroadcastOutput::SaveSettings() const
 		Settings, BroadcastSettingsSlot, BroadcastSettingsUserIndex);
 }
 
-void AVPBroadcastOutput::SendObsBackgroundCommand()
+void AVPBroadcastOutput::SendInputCameraCommand(
+	const TCHAR* Action,
+	const FString& DeviceId)
 {
-	const TCHAR* Mode = BackgroundMode == EVPBroadcastBackgroundMode::BackgroundRemoved
-		? TEXT("background_removed")
-		: TEXT("solid_color");
-	const FString Payload = FString::Printf(
-		TEXT("{\"version\":1,\"type\":\"broadcast_background\",\"mode\":\"%s\",")
-		TEXT("\"sender\":\"%s\",\"source\":\"%s\",\"filter\":\"%s\"}"),
-		Mode,
-		*SpoutSenderName,
-		*ObsSourceName,
-		*ObsFilterName);
+	const FString Payload = DeviceId.IsEmpty()
+		? FString::Printf(
+			TEXT("{\"version\":1,\"type\":\"camera_control\",\"action\":\"%s\"}"),
+			Action)
+		: FString::Printf(
+			TEXT("{\"version\":1,\"type\":\"camera_control\",\"action\":\"%s\",\"device_id\":\"%s\"}"),
+			Action,
+			*DeviceId);
 	SendControlPayload(Payload);
 }
 
-void AVPBroadcastOutput::SendObsFPSCommand()
+void AVPBroadcastOutput::PollControlResponses()
 {
-	const FString Payload = FString::Printf(
-		TEXT("{\"version\":1,\"type\":\"broadcast_fps\",\"fps\":%d}"),
-		OutputFramesPerSecond);
-	ObsFPSStatusText = FString::Printf(
-		TEXT("앱·Spout %d FPS · OBS 확인 중"),
-		OutputFramesPerSecond);
-	SendControlPayload(Payload);
-}
-
-void AVPBroadcastOutput::PollObsControlResponses()
-{
-	if (!ObsControlSocket)
+	if (!ControlSocket)
 	{
 		return;
 	}
 
 	uint32 PendingBytes = 0;
-	while (ObsControlSocket->HasPendingData(PendingBytes))
+	while (ControlSocket->HasPendingData(PendingBytes))
 	{
 		TArray<uint8> Buffer;
-		Buffer.SetNumUninitialized(FMath::Min<uint32>(PendingBytes, 2048u) + 1u);
+		Buffer.SetNumUninitialized(FMath::Min<uint32>(PendingBytes, 8192u) + 1u);
 		TSharedRef<FInternetAddr> ReplyAddress =
 			ISocketSubsystem::Get(PLATFORM_SOCKETSUBSYSTEM)->CreateInternetAddr();
 		int32 BytesRead = 0;
-		if (!ObsControlSocket->RecvFrom(
+		if (!ControlSocket->RecvFrom(
 			Buffer.GetData(),
 			Buffer.Num() - 1,
 			BytesRead,
@@ -753,55 +911,98 @@ void AVPBroadcastOutput::PollObsControlResponses()
 		const FString Payload(UTF8_TO_TCHAR(reinterpret_cast<const char*>(Buffer.GetData())));
 		TSharedPtr<FJsonObject> Root;
 		const TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(Payload);
-		if (!FJsonSerializer::Deserialize(Reader, Root) || !Root.IsValid() ||
-			Root->GetIntegerField(TEXT("version")) != 1 ||
-			Root->GetStringField(TEXT("type")) != TEXT("broadcast_fps_result"))
+		if (!FJsonSerializer::Deserialize(Reader, Root) || !Root.IsValid())
+		{
+			continue;
+		}
+		double Version = 0.0;
+		FString ResponseType;
+		if (!Root->TryGetNumberField(TEXT("version"), Version) ||
+			FMath::RoundToInt(Version) != 1 ||
+			!Root->TryGetStringField(TEXT("type"), ResponseType))
 		{
 			continue;
 		}
 
-		const FString Status = Root->GetStringField(TEXT("status"));
-		const int32 RequestedFPS = SanitizeOutputFPS(
-			Root->GetIntegerField(TEXT("requested_fps")));
-		double ObsFPS = 0.0;
-		Root->TryGetNumberField(TEXT("obs_fps"), ObsFPS);
-		const FString ObsFPSLabel = FMath::IsNearlyEqual(
-			static_cast<float>(ObsFPS),
-			FMath::RoundToFloat(static_cast<float>(ObsFPS)),
-			0.001f)
-			? FString::FromInt(FMath::RoundToInt(ObsFPS))
-			: FString::Printf(TEXT("%.2f"), ObsFPS);
+		if (ResponseType == TEXT("camera_control_result"))
+		{
+			FString Action;
+			FString Status;
+			FString ResponseActiveId;
+			if (!Root->TryGetStringField(TEXT("action"), Action) ||
+				!Root->TryGetStringField(TEXT("status"), Status) ||
+				!Root->TryGetStringField(TEXT("active_device_id"), ResponseActiveId))
+			{
+				continue;
+			}
 
-		if (Status == TEXT("applied") || Status == TEXT("unchanged"))
-		{
-			ObsFPSStatusText = FString::Printf(
-				TEXT("앱·Spout·OBS %d FPS · 동기화됨"),
-				RequestedFPS);
+			TArray<FVPInputCameraDevice> ResponseDevices;
+			const TArray<TSharedPtr<FJsonValue>>* DeviceValues = nullptr;
+			if (Root->TryGetArrayField(TEXT("devices"), DeviceValues) && DeviceValues)
+			{
+				for (const TSharedPtr<FJsonValue>& DeviceValue : *DeviceValues)
+				{
+					const TSharedPtr<FJsonObject> DeviceObject = DeviceValue.IsValid()
+						? DeviceValue->AsObject()
+						: nullptr;
+					if (!DeviceObject.IsValid())
+					{
+						continue;
+					}
+					FVPInputCameraDevice Device;
+					if (!DeviceObject->TryGetStringField(TEXT("id"), Device.Id) ||
+						!DeviceObject->TryGetStringField(TEXT("name"), Device.DisplayName) ||
+						Device.Id.IsEmpty() || Device.Id.Len() > 64 ||
+						Device.DisplayName.IsEmpty() || Device.DisplayName.Len() > 128 ||
+						!Algo::AllOf(Device.Id, [](const TCHAR Character)
+						{
+							return FChar::IsAlnum(Character);
+						}))
+					{
+						continue;
+					}
+					DeviceObject->TryGetBoolField(TEXT("is_virtual"), Device.bIsVirtual);
+					ResponseDevices.Add(MoveTemp(Device));
+				}
+			}
+
+			const bool bPreservePreviousList =
+				Status == TEXT("failed") && ResponseDevices.IsEmpty() && !InputCameraDevices.IsEmpty();
+			if (!bPreservePreviousList)
+			{
+				InputCameraDevices = MoveTemp(ResponseDevices);
+			}
+			ActiveInputCameraId = ResponseActiveId;
+			bInputCameraListReceived = Status != TEXT("failed");
+			++InputCameraListRevision;
+			const FVPInputCameraDevice* ActiveDevice = InputCameraDevices.FindByPredicate(
+				[this](const FVPInputCameraDevice& Device)
+				{
+					return Device.Id == ActiveInputCameraId;
+				});
+			InputCameraStatusText = ActiveDevice
+				? FString::Printf(TEXT("입력 카메라 · %s"), *ActiveDevice->DisplayName)
+				: (Status == TEXT("failed")
+					? TEXT("입력 카메라 목록 확인 실패")
+					: TEXT("사용 가능한 입력 카메라 없음"));
+			UE_LOG(LogTemp, Log,
+				TEXT("[VPInputCamera] Action=%s Status=%s Devices=%d Active=%s"),
+				*Action,
+				*Status,
+				InputCameraDevices.Num(),
+				ActiveDevice ? *ActiveDevice->DisplayName : TEXT("none"));
+
+			FString Message;
+			Root->TryGetStringField(TEXT("message"), Message);
+			if (!Message.IsEmpty())
+			{
+				InputCameraNoticeText = Message;
+				bInputCameraNoticeError = Status == TEXT("failed");
+				++InputCameraNoticeRevision;
+			}
+			continue;
 		}
-		else if (Status == TEXT("output_active"))
-		{
-			ObsFPSStatusText = FString::Printf(
-				TEXT("앱·Spout %d FPS · OBS 출력 중 (%s FPS 유지)"),
-				RequestedFPS,
-				*ObsFPSLabel);
-			ObsFPSNoticeText = FString::Printf(
-				TEXT("OBS가 출력 중이므로 송출 FPS는 변하지 않습니다.\n")
-				TEXT("현재 앱과 Spout만 %d FPS로 변경되었습니다."),
-				RequestedFPS);
-			++ObsFPSNoticeRevision;
-		}
-		else if (Status == TEXT("unavailable"))
-		{
-			ObsFPSStatusText = FString::Printf(
-				TEXT("앱·Spout %d FPS · OBS 연결 안 됨"),
-				RequestedFPS);
-		}
-		else if (Status == TEXT("failed"))
-		{
-			ObsFPSStatusText = FString::Printf(
-				TEXT("앱·Spout %d FPS · OBS 동기화 실패"),
-				RequestedFPS);
-		}
+
 	}
 }
 
@@ -820,7 +1021,7 @@ void AVPBroadcastOutput::SendLifecycleCommand(const TCHAR* Event)
 
 void AVPBroadcastOutput::SendControlPayload(const FString& Payload)
 {
-	if (!ObsControlSocket)
+	if (!ControlSocket)
 	{
 		return;
 	}
@@ -832,14 +1033,14 @@ void AVPBroadcastOutput::SendControlPayload(const FString& Payload)
 	bool bAddressValid = false;
 	TSharedRef<FInternetAddr> Address = SocketSubsystem->CreateInternetAddr();
 	Address->SetIp(TEXT("127.0.0.1"), bAddressValid);
-	Address->SetPort(ObsControlPort);
+	Address->SetPort(ControlPort);
 	if (!bAddressValid)
 	{
 		return;
 	}
 	FTCHARToUTF8 Utf8Payload(*Payload);
 	int32 BytesSent = 0;
-	ObsControlSocket->SendTo(
+	ControlSocket->SendTo(
 		reinterpret_cast<const uint8*>(Utf8Payload.Get()),
 		Utf8Payload.Length(),
 		BytesSent,

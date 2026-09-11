@@ -40,7 +40,8 @@ private:
 /**
  * UDP Receiver Component
  * Listens for binary tracking packets from Python vp-tracker/sender.py
- * Parses the packet on the network thread, delivers to game thread via TQueue
+ * Parses packets on the network thread and hands off only the latest frame
+ * to the game thread through a single-slot mailbox.
  */
 UCLASS(ClassGroup = (VPPipeline), meta = (BlueprintSpawnableComponent))
 class VPTRACKERRECEIVER_API UVPUDPReceiver : public UActorComponent

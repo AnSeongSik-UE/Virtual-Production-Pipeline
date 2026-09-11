@@ -272,6 +272,19 @@ IMPLEMENT_SIMPLE_AUTOMATION_TEST(
 
 bool FVPTrackingTransportStatusTest::RunTest(const FString& Parameters)
 {
+	TestTrue(TEXT("A long minimized interval restarts the input-rate sample"),
+		UVPTrackingDashboard::ShouldRestartPacketRateSample(47.0));
+	TestFalse(TEXT("A normal frame interval keeps the input-rate sample"),
+		UVPTrackingDashboard::ShouldRestartPacketRateSample(1.0 / 60.0));
+	TestTrue(TEXT("Wall-clock rate stays near 30 after 1411 packets over 47 seconds"),
+		FMath::IsNearlyEqual(
+			UVPTrackingDashboard::CalculatePacketRate(1411, 47.0),
+			30.0213f,
+			0.001f));
+	TestEqual(TEXT("Invalid elapsed time produces a zero rate"),
+		UVPTrackingDashboard::CalculatePacketRate(30, 0.0),
+		0.0f);
+
 	const FString Connecting = UVPTrackingDashboard::BuildTrackingStatusText(
 		false, 0.0f, 0.0f, false, false, false, false).ToString();
 	TestTrue(TEXT("Initial sample reports connecting"), Connecting.Contains(TEXT("데이터 연결 중")));
@@ -279,12 +292,16 @@ bool FVPTrackingTransportStatusTest::RunTest(const FString& Parameters)
 
 	const FString Healthy = UVPTrackingDashboard::BuildTrackingStatusText(
 		true, 29.6f, 0.1f, true, true, true, true).ToString();
-	TestTrue(TEXT("Healthy rate is rounded for the user"), Healthy.Contains(TEXT("데이터 정상 30fps")));
+	TestTrue(TEXT("Healthy tracking input rate is distinct from broadcast FPS"),
+		Healthy.Contains(TEXT("트래킹 입력 정상 · 30회/초")));
+	TestFalse(TEXT("Tracking input rate does not use the broadcast FPS unit"),
+		Healthy.Contains(TEXT("fps")) || Healthy.Contains(TEXT("FPS")));
 	TestTrue(TEXT("Tracking summaries remain visible"), Healthy.Contains(TEXT("오른팔 추적")));
 
 	const FString Delayed = UVPTrackingDashboard::BuildTrackingStatusText(
 		true, 12.4f, 0.1f, true, true, true, false).ToString();
-	TestTrue(TEXT("Low rate reports delay"), Delayed.Contains(TEXT("데이터 지연 12fps")));
+	TestTrue(TEXT("Low tracking input rate reports delay"),
+		Delayed.Contains(TEXT("트래킹 입력 지연 · 12회/초")));
 
 	const FString Disconnected = UVPTrackingDashboard::BuildTrackingStatusText(
 		true, 30.0f, 0.5f, false, false, false, false).ToString();
@@ -525,6 +542,8 @@ bool FVPAvatarCameraSerializationTest::RunTest(const FString& Parameters)
 	Camera.RelativeTransform = FTransform(
 		FRotator(-4.0, 181.0, 0.0), FVector(150.0, -20.0, 135.0));
 	Camera.FieldOfView = 52.0f;
+	Camera.bHasOrbitPivot = true;
+	Camera.RelativeOrbitPivot = FVector(5.0f, 12.0f, 130.0f);
 	Source->AvatarCameraSettings.Add(TEXT("avatar-a"), Camera);
 
 	TArray<uint8> Bytes;
@@ -544,6 +563,10 @@ bool FVPAvatarCameraSerializationTest::RunTest(const FString& Parameters)
 		{
 			TestTrue(TEXT("Camera transform persists"), LoadedCamera->RelativeTransform.Equals(Camera.RelativeTransform));
 			TestEqual(TEXT("Camera FOV persists"), LoadedCamera->FieldOfView, Camera.FieldOfView);
+			TestTrue(TEXT("Camera orbit pivot flag persists"), LoadedCamera->bHasOrbitPivot);
+			TestTrue(
+				TEXT("Camera orbit pivot persists"),
+				LoadedCamera->RelativeOrbitPivot.Equals(Camera.RelativeOrbitPivot));
 		}
 	}
 	TestEqual(TEXT("Output FPS clamps low"), AVPBroadcastOutput::SanitizeOutputFPS(1), 15);
@@ -599,6 +622,105 @@ bool FVPBroadcastInitialCameraDirectionTest::RunTest(const FString& Parameters)
 	TestTrue(
 		TEXT("Body centering preserves bounds vertical center"),
 		FMath::IsNearlyEqual(FramingOrigin.Z, AsymmetricBoundsOrigin.Z, 0.001f));
+
+	const FRotator FrontRotation = AVPBroadcastOutput::GetAvatarFrontCameraRotation();
+	TestTrue(
+		TEXT("VRM front camera uses the normalized front yaw"),
+		FMath::IsNearlyEqual(FrontRotation.Yaw, -90.0f, 0.001f));
+	const FTransform FrontTransform = AVPBroadcastOutput::CalculateInitialCameraTransform(
+		CenteredBoundsOrigin,
+		CameraDistance,
+		FrontRotation);
+	TestTrue(
+		TEXT("VRM front camera is placed on the avatar-facing side"),
+		FrontTransform.GetLocation().Equals(FVector(0.0f, CameraDistance, 100.0f), 0.001f));
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FVPAvatarHumanoidFramingBoundsTest,
+	"VPPipeline.Broadcast.HumanoidFramingBounds",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FVPAvatarHumanoidFramingBoundsTest::RunTest(const FString& Parameters)
+{
+	const FBox PathologicalRenderBounds(
+		FVector(-900.0f, -500.0f, -400.0f),
+		FVector(1200.0f, 700.0f, 1600.0f));
+	FBox FramingBounds;
+	TestTrue(
+		TEXT("Valid humanoid landmarks produce framing bounds"),
+		AVPAvatarManager::CalculateHumanoidFramingBounds(
+			PathologicalRenderBounds,
+			FVector(0.0f, 0.0f, 160.0f),
+			FVector(-70.0f, 0.0f, 100.0f),
+			FVector(70.0f, 0.0f, 100.0f),
+			FVector(-10.0f, 0.0f, 0.0f),
+			FVector(10.0f, 0.0f, 0.0f),
+			FramingBounds));
+	TestTrue(
+		TEXT("Pathological horizontal render bounds are capped"),
+		FramingBounds.Min.X >= -104.01f && FramingBounds.Max.X <= 104.01f);
+	TestTrue(
+		TEXT("Pathological vertical render bounds are capped with accessory headroom"),
+		FMath::IsNearlyEqual(FramingBounds.Min.Z, -12.8f, 0.01f) &&
+		FMath::IsNearlyEqual(FramingBounds.Max.Z, 216.0f, 0.01f));
+	TestTrue(
+		TEXT("Humanoid framing is vertically centered around the capped body range"),
+		FMath::IsNearlyEqual(FramingBounds.GetCenter().Z, 101.6f, 0.01f));
+
+	FBox InvalidBounds;
+	TestFalse(
+		TEXT("Degenerate head-to-foot height falls back to actor bounds"),
+		AVPAvatarManager::CalculateHumanoidFramingBounds(
+			PathologicalRenderBounds,
+			FVector::ZeroVector,
+			FVector::ZeroVector,
+			FVector::ZeroVector,
+			FVector::ZeroVector,
+			FVector::ZeroVector,
+			InvalidBounds));
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FVPBroadcastCameraOrbitTest,
+	"VPPipeline.Broadcast.CameraOrbit",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FVPBroadcastCameraOrbitTest::RunTest(const FString& Parameters)
+{
+	const FVector Pivot(0.0f, 0.0f, 120.0f);
+	const FTransform Initial = AVPBroadcastOutput::CalculateInitialCameraTransform(
+		Pivot,
+		500.0f,
+		AVPBroadcastOutput::GetAvatarFrontCameraRotation());
+	const FTransform Orbited = AVPBroadcastOutput::CalculateOrbitCameraTransform(
+		Initial,
+		Pivot,
+		FVector2D(120.0f, -40.0f));
+
+	TestTrue(
+		TEXT("Orbit preserves distance from pivot"),
+		FMath::IsNearlyEqual(
+			FVector::Distance(Orbited.GetLocation(), Pivot),
+			FVector::Distance(Initial.GetLocation(), Pivot),
+			0.01f));
+	const FVector ExpectedView = (Pivot - Orbited.GetLocation()).GetSafeNormal();
+	TestTrue(
+		TEXT("Orbit camera keeps looking at pivot"),
+		Orbited.GetRotation().GetForwardVector().Equals(ExpectedView, 0.001f));
+	TestFalse(
+		TEXT("Horizontal orbit changes camera yaw"),
+		FMath::IsNearlyEqual(Orbited.Rotator().Yaw, Initial.Rotator().Yaw, 0.001f));
+
+	const FTransform PitchClamped = AVPBroadcastOutput::CalculateOrbitCameraTransform(
+		Initial,
+		Pivot,
+		FVector2D(0.0f, 10000.0f));
+	TestTrue(
+		TEXT("Vertical orbit pitch is clamped"),
+		FMath::IsNearlyEqual(PitchClamped.Rotator().Pitch, 60.0f, 0.01f));
 	return true;
 }
 

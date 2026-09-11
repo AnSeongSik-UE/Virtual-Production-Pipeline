@@ -3,8 +3,6 @@
 import subprocess
 import sys
 import unittest
-from contextlib import redirect_stdout
-from io import StringIO
 from unittest.mock import Mock, patch
 import uuid
 from pathlib import Path
@@ -19,11 +17,9 @@ from lifecycle import (
     parse_lifecycle_command,
     stop_process,
 )
-from obs_controller import OBSOutputActionResult, OBSOutputStatus
 from supervisor import (
     PipelineSupervisor,
     RUNTIME_DISABLED_PLUGINS,
-    STREAM_CONFIRM_TIMEOUT_SECONDS,
     _is_normal_unreal_exit,
 )
 
@@ -61,54 +57,6 @@ class FakeProcess:
 
     def kill(self):
         self.killed = True
-
-
-class FakeSupervisorOBS:
-    def __init__(self):
-        self.streaming = False
-        self.recording = False
-        self.start_stream_calls = 0
-        self.start_record_calls = 0
-        self.stop_stream_calls = 0
-        self.stop_record_calls = 0
-        self.disconnected = False
-
-    def get_output_status(self):
-        return OBSOutputStatus(
-            stream_active=self.streaming,
-            stream_duration_ms=3_000 if self.streaming else 0,
-            stream_bytes=1_048_576 if self.streaming else 0,
-            record_active=self.recording,
-            record_paused=False,
-            record_duration_ms=2_000 if self.recording else 0,
-            record_bytes=524_288 if self.recording else 0,
-            record_path="",
-        )
-
-    def start_streaming(self):
-        self.start_stream_calls += 1
-        self.streaming = True
-        return OBSOutputActionResult("started")
-
-    def stop_streaming(self):
-        self.stop_stream_calls += 1
-        self.streaming = False
-        return OBSOutputActionResult("stopped")
-
-    def start_recording(self):
-        if self.recording:
-            return OBSOutputActionResult("already_active")
-        self.start_record_calls += 1
-        self.recording = True
-        return OBSOutputActionResult("started")
-
-    def stop_recording(self):
-        self.stop_record_calls += 1
-        self.recording = False
-        return OBSOutputActionResult("stopped", "C:/recordings/test.mkv")
-
-    def disconnect(self):
-        self.disconnected = True
 
 
 class LifecycleProtocolTests(unittest.TestCase):
@@ -159,89 +107,6 @@ class LifecycleProtocolTests(unittest.TestCase):
 
 
 class ProcessShutdownTests(unittest.TestCase):
-    def test_streaming_requires_a_fresh_second_confirmation(self):
-        supervisor = PipelineSupervisor(
-            unreal_executable=Path("C:/UE/UnrealEditor.exe"),
-            project_path=Path("C:/Project/VPPipeline.uproject"),
-        )
-        obs = FakeSupervisorOBS()
-        supervisor.obs_ctrl = obs
-
-        with redirect_stdout(StringIO()), patch(
-            "supervisor.time.monotonic",
-            return_value=100.0,
-        ):
-            supervisor._handle_command("stream")
-        self.assertEqual(obs.start_stream_calls, 0)
-
-        with redirect_stdout(StringIO()), patch(
-            "supervisor.time.monotonic",
-            return_value=100.0 + STREAM_CONFIRM_TIMEOUT_SECONDS,
-        ):
-            supervisor._handle_command("stream confirm")
-        self.assertEqual(obs.start_stream_calls, 1)
-
-    def test_expired_stream_confirmation_cannot_start_output(self):
-        supervisor = PipelineSupervisor(
-            unreal_executable=Path("C:/UE/UnrealEditor.exe"),
-            project_path=Path("C:/Project/VPPipeline.uproject"),
-        )
-        obs = FakeSupervisorOBS()
-        supervisor.obs_ctrl = obs
-
-        with redirect_stdout(StringIO()), patch(
-            "supervisor.time.monotonic",
-            return_value=100.0,
-        ):
-            supervisor._handle_command("stream")
-        output = StringIO()
-        with redirect_stdout(output), patch(
-            "supervisor.time.monotonic",
-            return_value=100.001 + STREAM_CONFIRM_TIMEOUT_SECONDS,
-        ):
-            supervisor._handle_command("stream confirm")
-
-        self.assertEqual(obs.start_stream_calls, 0)
-        self.assertIn("expired", output.getvalue())
-
-    def test_recording_command_starts_once_and_status_lists_both_outputs(self):
-        supervisor = PipelineSupervisor(
-            unreal_executable=Path("C:/UE/UnrealEditor.exe"),
-            project_path=Path("C:/Project/VPPipeline.uproject"),
-        )
-        obs = FakeSupervisorOBS()
-        supervisor.obs_ctrl = obs
-        output = StringIO()
-
-        with redirect_stdout(output):
-            supervisor._handle_command("rec")
-            supervisor._handle_command("rec")
-            supervisor._handle_command("status")
-
-        self.assertEqual(obs.start_record_calls, 1)
-        self.assertIn("Streaming: inactive", output.getvalue())
-        self.assertIn("[REC] Recording", output.getvalue())
-
-    def test_shutdown_warns_but_does_not_stop_external_obs_outputs(self):
-        supervisor = PipelineSupervisor(
-            unreal_executable=Path("C:/UE/UnrealEditor.exe"),
-            project_path=Path("C:/Project/VPPipeline.uproject"),
-        )
-        obs = FakeSupervisorOBS()
-        obs.streaming = True
-        obs.recording = True
-        supervisor.obs_ctrl = obs
-        output = StringIO()
-
-        with redirect_stdout(output):
-            supervisor._shutdown()
-
-        self.assertEqual(obs.stop_stream_calls, 0)
-        self.assertEqual(obs.stop_record_calls, 0)
-        self.assertTrue(obs.disconnected)
-        self.assertIn("Streaming remains active", output.getvalue())
-        self.assertIn("Recording remains active", output.getvalue())
-
     def test_managed_game_command_disables_editor_only_toolsets(self):
         supervisor = PipelineSupervisor(
             unreal_executable=Path("C:/UE/UnrealEditor.exe"),
@@ -258,6 +123,21 @@ class ProcessShutdownTests(unittest.TestCase):
             f"-DisablePlugins={','.join(RUNTIME_DISABLED_PLUGINS)}",
             command,
         )
+
+    def test_packaged_command_uses_runtime_without_editor_console(self):
+        supervisor = PipelineSupervisor(
+            unreal_executable=Path("C:/Release/Runtime/VPPipeline.exe"),
+            packaged_mode=True,
+            interactive_commands=False,
+        )
+
+        command = supervisor._build_unreal_command()
+
+        self.assertEqual(command[0], str(Path("C:/Release/Runtime/VPPipeline.exe").resolve()))
+        self.assertIn("/Game/Maps/Lvl_Empty", command)
+        self.assertIn("-SaveToUserDir", command)
+        self.assertNotIn("-game", command)
+        self.assertNotIn("-log", command)
         self.assertTrue(callable(supervisor._check_webcam))
         self.assertTrue(callable(supervisor._check_models))
         self.assertTrue(callable(supervisor._check_pipeline_ports))

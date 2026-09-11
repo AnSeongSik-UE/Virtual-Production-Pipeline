@@ -5,6 +5,7 @@
 #include "GameFramework/SaveGame.h"
 #include "VPAvatarManager.generated.h"
 
+class FVPAvatarFileDialog;
 class AVPBroadcastOutput;
 class UDataTable;
 class USceneComponent;
@@ -20,7 +21,6 @@ enum class EVPAvatarNoticeSeverity : uint8
 	Info,
 	Error
 };
-
 USTRUCT(BlueprintType)
 struct FVPAvatarLibraryEntry
 {
@@ -63,6 +63,7 @@ public:
 
 	virtual void Tick(float DeltaSeconds) override;
 	virtual void BeginPlay() override;
+	virtual void EndPlay(const EEndPlayReason::Type EndPlayReason) override;
 
 	void Initialize(AVPBroadcastOutput* InBroadcastOutput);
 	bool OpenAvatarFileDialog();
@@ -82,6 +83,7 @@ public:
 	int32 GetLibraryRevision() const { return LibraryRevision; }
 	bool HasActiveAvatar() const;
 	UVPAnimInstance* GetActiveAnimInstance() const;
+	bool TryGetHumanoidFramingBounds(FBox& OutBounds) const;
 
 	static FString BuildAvatarId(const TArray<uint8>& FileData);
 	static bool IsValidAvatarId(const FString& AvatarId);
@@ -92,6 +94,14 @@ public:
 		bool bHasAssetList,
 		bool bHasSkeletalMesh,
 		bool bHasAnimInstance);
+	static bool CalculateHumanoidFramingBounds(
+		const FBox& RenderBounds,
+		const FVector& Head,
+		const FVector& LeftHand,
+		const FVector& RightHand,
+		const FVector& LeftFoot,
+		const FVector& RightFoot,
+		FBox& OutBounds);
 
 private:
 	UPROPERTY(VisibleAnywhere)
@@ -130,6 +140,8 @@ private:
 	FString StatusText = TEXT("아바타 없음 · VRM 파일을 추가하세요.");
 	FString UserNoticeText;
 	EVPAvatarNoticeSeverity UserNoticeSeverity = EVPAvatarNoticeSeverity::Info;
+	TSharedPtr<FVPAvatarFileDialog> FileDialog;
+	bool bEndingPlay = false;
 	bool bLoadPending = false;
 	bool bPendingEntryIsNew = false;
 	int32 LibraryRevision = 0;

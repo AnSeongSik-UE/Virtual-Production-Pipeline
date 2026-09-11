@@ -1,40 +1,28 @@
-"""
-VP Pipeline - UDP/OSC 네트워크 발신
-트래킹 데이터를 언리얼 엔진으로 전송
-"""
+"""VP Pipeline VPTP UDP sender."""
 import os
 import socket
 import sys
 import time
-from pythonosc import udp_client
+from camera_devices import (
+    CameraDevice,
+    choose_startup_camera,
+    enumerate_camera_devices,
+    find_camera,
+    load_selected_camera_id,
+    save_selected_camera_id,
+)
 from lifecycle import (
     DEFAULT_HEARTBEAT_TIMEOUT_SECONDS,
     DEFAULT_STARTUP_TIMEOUT_SECONDS,
     LifecycleLease,
 )
-from obs_control import OBSControlListener
+from control_channel import ControlListener, QueuedCameraCommand
 from tracker import UnifiedTracker, TrackingFrame
 from protocol import encode_packet
 
 
-class OSCSender:
-    """python-osc를 활용한 OSC 프로토콜 전송"""
-
-    def __init__(self, host: str = "127.0.0.1", port: int = 7000):
-        self.client = udp_client.SimpleUDPClient(host, port)
-
-    def send_tracking_frame(self, frame: TrackingFrame):
-        # 블렌드쉐이프 전송 (52개 float)
-        for name, value in frame.blendshapes.items():
-            self.client.send_message(f"/face/{name}", value)
-
-        # 포즈 랜드마크 전송 (33 x 3 = 99 floats)
-        for i, (x, y, z, visibility, presence) in enumerate(frame.pose_landmarks):
-            self.client.send_message(f"/pose/{i}", [x, y, z])
-
-
 class RawUDPSender:
-    """고성능 바이너리 UDP 전송 (OSC 오버헤드 없음)"""
+    """VPTP 바이너리 UDP 전송."""
 
     def __init__(self, host: str = "127.0.0.1", port: int = 7000):
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -72,6 +60,68 @@ def _positive_timeout_from_env(name: str, default: float) -> float:
     return value
 
 
+def _camera_payload(devices: list[CameraDevice]) -> list[dict[str, str | bool]]:
+    return [device.to_control_payload() for device in devices]
+
+
+def _handle_camera_command(
+    listener: ControlListener,
+    queued: QueuedCameraCommand,
+    tracker: UnifiedTracker,
+    active_device: CameraDevice,
+    startup_notice: str,
+) -> tuple[CameraDevice, str]:
+    try:
+        devices = enumerate_camera_devices()
+    except Exception as exc:
+        listener.send_camera_result(
+            queued.reply_address,
+            action=queued.command.action,
+            status="failed",
+            active_device_id=active_device.device_id,
+            devices=[],
+            message=f"카메라 목록을 읽지 못했습니다: {type(exc).__name__}",
+        )
+        return active_device, startup_notice
+
+    status = "ok"
+    message = startup_notice if queued.command.action == "list" else ""
+    if queued.command.action == "select":
+        selected = find_camera(devices, queued.command.device_id)
+        if selected is None:
+            status = "failed"
+            message = "선택한 카메라가 연결되어 있지 않습니다. 목록을 새로고침하세요."
+        elif selected.device_id == active_device.device_id:
+            status = "unchanged"
+            message = f"이미 {selected.display_name} 카메라를 사용 중입니다."
+        else:
+            success, detail = tracker.switch_camera(selected.index, selected.backend)
+            if success:
+                active_device = selected
+                status = "applied"
+                message = f"입력 카메라를 {selected.display_name}(으)로 변경했습니다."
+                try:
+                    save_selected_camera_id(selected.device_id)
+                except OSError:
+                    message += " 선택 저장에는 실패했습니다."
+            else:
+                status = "failed"
+                message = (
+                    f"{selected.display_name} 카메라를 열지 못했습니다. "
+                    f"기존 카메라를 계속 사용합니다. ({detail})"
+                )
+
+    listener.send_camera_result(
+        queued.reply_address,
+        action=queued.command.action,
+        status=status,
+        active_device_id=active_device.device_id,
+        devices=_camera_payload(devices),
+        message=message,
+    )
+    return active_device, ""
+
+
 def main() -> int:
     """트래킹 + 네트워크 발신 통합 실행"""
     session_token = os.getenv("VP_SESSION_TOKEN", "").strip()
@@ -88,29 +138,57 @@ def main() -> int:
         startup_timeout=startup_timeout,
         heartbeat_timeout=heartbeat_timeout,
     ) if session_token else None
-    tracker = UnifiedTracker(camera_id=0)
-    sender = RawUDPSender(host="127.0.0.1", port=7000)
-    obs_control = OBSControlListener(lifecycle_lease=lifecycle_lease)
-    # OSC가 필요하면: sender = OSCSender(host="127.0.0.1", port=7000)
-
+    devices = enumerate_camera_devices()
+    active_device, used_fallback = choose_startup_camera(
+        devices,
+        load_selected_camera_id(),
+    )
+    if active_device is None:
+        raise RuntimeError("사용 가능한 카메라가 없습니다")
+    startup_notice = ""
+    if used_fallback:
+        startup_notice = (
+            "저장된 카메라를 찾지 못해 "
+            f"{active_device.display_name}(으)로 전환했습니다."
+        )
     try:
-        obs_control.start()
+        save_selected_camera_id(active_device.device_id)
+    except OSError:
+        print("[CAM] Could not persist the selected camera")
+    tracker = UnifiedTracker(
+        camera_id=active_device.index,
+        camera_backend=active_device.backend,
+    )
+    sender = RawUDPSender(host="127.0.0.1", port=7000)
+    control_listener = ControlListener(lifecycle_lease=lifecycle_lease)
+    try:
+        control_listener.start()
         if lifecycle_lease:
             print(f"[*] Waiting up to {startup_timeout:.0f}s for Unreal session...")
-            if not obs_control.wait_for_lifecycle_connection(startup_timeout):
+            if not control_listener.wait_for_lifecycle_connection(startup_timeout):
                 print("[FAIL] Unreal did not start before the lifecycle timeout")
                 return 3
-            if obs_control.lifecycle_should_shutdown():
-                print(f"[*] {obs_control.lifecycle_shutdown_reason()}")
+            if control_listener.lifecycle_should_shutdown():
+                print(f"[*] {control_listener.lifecycle_shutdown_reason()}")
                 return 0
         tracker.start()
         print(
+            f"[*] Camera: {active_device.display_name}\n"
             "[*] Tracking started. Sending to UE at 127.0.0.1:7000 "
             f"(Pose model: {tracker.pose_model_name})"
         )
         print("    (Ctrl+C to stop)")
         last_status_time = time.monotonic()
-        while not obs_control.lifecycle_should_shutdown():
+        while not control_listener.lifecycle_should_shutdown():
+            camera_command = control_listener.take_camera_command()
+            if camera_command is not None:
+                active_device, startup_notice = _handle_camera_command(
+                    control_listener,
+                    camera_command,
+                    tracker,
+                    active_device,
+                    startup_notice,
+                )
             tracker.raise_if_failed()
             frame = tracker.get_latest()
             if frame:
@@ -130,13 +208,13 @@ def main() -> int:
                     last_status_time = now
             time.sleep(1/60)  # ~60Hz
         if lifecycle_lease:
-            print(f"\n[*] {obs_control.lifecycle_shutdown_reason()}")
+            print(f"\n[*] {control_listener.lifecycle_shutdown_reason()}")
     except KeyboardInterrupt:
         print("\n[*] Stopping...")
     finally:
         tracker.stop()
         sender.close()
-        obs_control.stop()
+        control_listener.stop()
         print(f"[OK] Total {sender.send_count} packets sent")
     return 0
 

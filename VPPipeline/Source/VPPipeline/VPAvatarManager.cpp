@@ -1,4 +1,5 @@
 #include "VPAvatarManager.h"
+#include "VPAvatarFileDialog.h"
 
 #include "VPBroadcastOutput.h"
 #include "VPRuntimeAvatarAnimInstance.h"
@@ -81,6 +82,13 @@ void AVPAvatarManager::BeginPlay()
 	}
 }
 
+void AVPAvatarManager::EndPlay(const EEndPlayReason::Type EndPlayReason)
+{
+	bEndingPlay = true;
+	FileDialog.Reset();
+	Super::EndPlay(EndPlayReason);
+}
+
 void AVPAvatarManager::Initialize(AVPBroadcastOutput* InBroadcastOutput)
 {
 	BroadcastOutput = InBroadcastOutput;
@@ -94,6 +102,17 @@ void AVPAvatarManager::Initialize(AVPBroadcastOutput* InBroadcastOutput)
 void AVPAvatarManager::Tick(float DeltaSeconds)
 {
 	Super::Tick(DeltaSeconds);
+	if (FileDialog && FileDialog->IsComplete())
+	{
+		const FString SelectedFile = FileDialog->GetPath();
+		const uint32 DialogError = FileDialog->GetError();
+		FileDialog.Reset();
+		if (!bEndingPlay && !SelectedFile.IsEmpty()) { AddAvatarFromFile(SelectedFile); }
+		else if (!bEndingPlay && DialogError != 0)
+		{
+			PublishUserNotice(FString::Printf(TEXT("VRM 선택창을 열지 못했습니다. 오류: %u"), DialogError), EVPAvatarNoticeSeverity::Error);
+		}
+	}
 	UVPAnimInstance* RuntimeAnim = GetActiveAnimInstance();
 	if (RuntimeAnim && Receiver)
 	{
@@ -155,6 +174,90 @@ bool AVPAvatarManager::IsActiveAvatarStateComplete(
 	return bHasAvatarId && bHasAssetList && bHasSkeletalMesh && bHasAnimInstance;
 }
 
+bool AVPAvatarManager::CalculateHumanoidFramingBounds(
+	const FBox& RenderBounds,
+	const FVector& Head,
+	const FVector& LeftHand,
+	const FVector& RightHand,
+	const FVector& LeftFoot,
+	const FVector& RightFoot,
+	FBox& OutBounds)
+{
+	if (!RenderBounds.IsValid || Head.ContainsNaN() || LeftHand.ContainsNaN() ||
+		RightHand.ContainsNaN() || LeftFoot.ContainsNaN() || RightFoot.ContainsNaN())
+	{
+		return false;
+	}
+
+	const float FootZ = FMath::Min(LeftFoot.Z, RightFoot.Z);
+	const float BodyHeight = Head.Z - FootZ;
+	if (!FMath::IsFinite(BodyHeight) || BodyHeight < 20.0f)
+	{
+		return false;
+	}
+
+	const FVector FeetCenter = (LeftFoot + RightFoot) * 0.5f;
+	const FVector BodyCenter = (Head + FeetCenter) * 0.5f;
+	const float MaxHorizontalRadius = BodyHeight * 0.65f;
+	const float BoneMargin = BodyHeight * 0.04f;
+	const float RawBoneMinX = FMath::Min(
+		FMath::Min3(Head.X, LeftHand.X, RightHand.X),
+		FMath::Min(LeftFoot.X, RightFoot.X));
+	const float RawBoneMaxX = FMath::Max(
+		FMath::Max3(Head.X, LeftHand.X, RightHand.X),
+		FMath::Max(LeftFoot.X, RightFoot.X));
+	const float RequiredMinX = FMath::Max(BodyCenter.X - MaxHorizontalRadius, RawBoneMinX - BoneMargin);
+	const float RequiredMaxX = FMath::Min(BodyCenter.X + MaxHorizontalRadius, RawBoneMaxX + BoneMargin);
+	const float MinX = FMath::Clamp(RenderBounds.Min.X, BodyCenter.X - MaxHorizontalRadius, RequiredMinX);
+	const float MaxX = FMath::Clamp(RenderBounds.Max.X, RequiredMaxX, BodyCenter.X + MaxHorizontalRadius);
+
+	const float MinZ = FMath::Clamp(
+		RenderBounds.Min.Z,
+		FootZ - BodyHeight * 0.08f,
+		FootZ - BodyHeight * 0.02f);
+	const float MaxZ = FMath::Clamp(
+		RenderBounds.Max.Z,
+		Head.Z + BodyHeight * 0.12f,
+		Head.Z + BodyHeight * 0.35f);
+	const float DepthRadius = BodyHeight * 0.12f;
+
+	OutBounds = FBox(
+		FVector(MinX, BodyCenter.Y - DepthRadius, MinZ),
+		FVector(MaxX, BodyCenter.Y + DepthRadius, MaxZ));
+	return OutBounds.IsValid && !OutBounds.GetExtent().IsNearlyZero();
+}
+
+bool AVPAvatarManager::TryGetHumanoidFramingBounds(FBox& OutBounds) const
+{
+	if (!RuntimeMesh || !ActiveAssetList || !RuntimeMesh->GetSkeletalMeshAsset())
+	{
+		return false;
+	}
+
+	const FName HeadBone = ResolveHumanoidBoneName(ActiveAssetList, TEXT("head"));
+	const FName LeftHandBone = ResolveHumanoidBoneName(ActiveAssetList, TEXT("leftHand"));
+	const FName RightHandBone = ResolveHumanoidBoneName(ActiveAssetList, TEXT("rightHand"));
+	const FName LeftFootBone = ResolveHumanoidBoneName(ActiveAssetList, TEXT("leftFoot"));
+	const FName RightFootBone = ResolveHumanoidBoneName(ActiveAssetList, TEXT("rightFoot"));
+	const FName RequiredBones[] = {HeadBone, LeftHandBone, RightHandBone, LeftFootBone, RightFootBone};
+	for (const FName BoneName : RequiredBones)
+	{
+		if (BoneName.IsNone() || RuntimeMesh->GetBoneIndex(BoneName) == INDEX_NONE)
+		{
+			return false;
+		}
+	}
+
+	return CalculateHumanoidFramingBounds(
+		RuntimeMesh->Bounds.GetBox(),
+		RuntimeMesh->GetBoneLocation(HeadBone),
+		RuntimeMesh->GetBoneLocation(LeftHandBone),
+		RuntimeMesh->GetBoneLocation(RightHandBone),
+		RuntimeMesh->GetBoneLocation(LeftFootBone),
+		RuntimeMesh->GetBoneLocation(RightFootBone),
+		OutBounds);
+}
+
 FString AVPAvatarManager::BuildAlreadyRegisteredNotice(const FString& DisplayName)
 {
 	return FString::Printf(
@@ -164,9 +267,19 @@ FString AVPAvatarManager::BuildAlreadyRegisteredNotice(const FString& DisplayNam
 
 bool AVPAvatarManager::OpenAvatarFileDialog()
 {
-	FString SelectedFile;
-	return DropFiles && DropFiles->VRMGetOpenFileName(SelectedFile) &&
-		AddAvatarFromFile(SelectedFile);
+	if (bEndingPlay) { return false; }
+	if (FileDialog)
+	{
+		FileDialog->RequestForeground();
+		return true;
+	}
+	if (bLoadPending) { return false; }
+#if PLATFORM_WINDOWS
+	FileDialog = MakeShared<FVPAvatarFileDialog>();
+	return true;
+#else
+	return false;
+#endif
 }
 
 bool AVPAvatarManager::AddAvatarFromFile(const FString& SourcePath)
@@ -246,27 +359,56 @@ bool AVPAvatarManager::SelectAvatar(const FString& AvatarId)
 
 UVrmAssetListObject* AVPAvatarManager::CreateVrmAssetTemplate() const
 {
-	UClass* TemplateClass = UVrmAssetListObject::StaticClass();
+	UClass* TemplateClass = nullptr;
 	if (const UVrmRuntimeSettings* Settings = GetDefault<UVrmRuntimeSettings>())
 	{
-		if (UObject* TemplateObject = Settings->AssetListObject.TryLoad())
+		const FString TemplateObjectPath = Settings->AssetListObject.ToString();
+		if (!TemplateObjectPath.IsEmpty())
 		{
-			if (const UBlueprint* TemplateBlueprint = Cast<UBlueprint>(TemplateObject))
+			// Cooked builds strip the UBlueprint object but retain its generated class.
+			// Load the class first so runtime VRM materials work outside the editor.
+			TemplateClass = StaticLoadClass(
+				UVrmAssetListObject::StaticClass(),
+				nullptr,
+				*(TemplateObjectPath + TEXT("_C")));
+		}
+		if (!TemplateClass)
+		{
+			if (UObject* TemplateObject = Settings->AssetListObject.TryLoad())
 			{
-				if (TemplateBlueprint->GeneratedClass &&
-					TemplateBlueprint->GeneratedClass->IsChildOf(UVrmAssetListObject::StaticClass()))
+				if (const UBlueprint* TemplateBlueprint = Cast<UBlueprint>(TemplateObject))
 				{
-					TemplateClass = TemplateBlueprint->GeneratedClass;
+					if (TemplateBlueprint->GeneratedClass &&
+						TemplateBlueprint->GeneratedClass->IsChildOf(UVrmAssetListObject::StaticClass()))
+					{
+						TemplateClass = TemplateBlueprint->GeneratedClass;
+					}
 				}
-			}
-			else if (UClass* LoadedClass = Cast<UClass>(TemplateObject);
-				LoadedClass && LoadedClass->IsChildOf(UVrmAssetListObject::StaticClass()))
-			{
-				TemplateClass = LoadedClass;
+				else if (UClass* LoadedClass = Cast<UClass>(TemplateObject);
+					LoadedClass && LoadedClass->IsChildOf(UVrmAssetListObject::StaticClass()))
+				{
+					TemplateClass = LoadedClass;
+				}
 			}
 		}
 	}
-	return NewObject<UVrmAssetListObject>(GetTransientPackage(), TemplateClass);
+	if (!TemplateClass)
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[VPAvatar] VRM4U runtime asset template is unavailable. Ensure /VRM4U is cooked."));
+		return nullptr;
+	}
+
+	UVrmAssetListObject* Template = NewObject<UVrmAssetListObject>(
+		GetTransientPackage(),
+		TemplateClass);
+	if (!Template || !Template->MtoonLitSet)
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("[VPAvatar] VRM4U MToon runtime material set is unavailable."));
+		return nullptr;
+	}
+	return Template;
 }
 
 void AVPAvatarManager::BeginLoad(const FString& AvatarId, bool bNewEntry)
@@ -304,7 +446,7 @@ void AVPAvatarManager::BeginLoad(const FString& AvatarId, bool bNewEntry)
 	PendingAssetTemplate = CreateVrmAssetTemplate();
 	if (!PendingAssetTemplate)
 	{
-		FailPendingLoad(TEXT("VRM4U 런타임 템플릿을 만들지 못했습니다."));
+		FailPendingLoad(TEXT("VRM4U 런타임 재질이 설치 또는 배포본에 포함되지 않았습니다."));
 		return;
 	}
 	ULoaderBPFunctionLibrary::VRMSetLoadMaterialType(EVRMImportMaterialType::VRMIMT_MToon);

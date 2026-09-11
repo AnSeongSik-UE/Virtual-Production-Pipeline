@@ -26,6 +26,7 @@
 #include "Engine/World.h"
 #include "EngineUtils.h"
 #include "Fonts/CompositeFont.h"
+#include "HAL/PlatformTime.h"
 #include "InputCoreTypes.h"
 #include "Misc/Paths.h"
 #include "Rendering/DrawElementTypes.h"
@@ -44,6 +45,7 @@ const FLinearColor TrackingGoodColor(0.13f, 0.92f, 0.48f, 1.0f);
 const FLinearColor TrackingWeakColor(1.0f, 0.67f, 0.12f, 1.0f);
 const FLinearColor TrackingLostColor(0.98f, 0.24f, 0.28f, 1.0f);
 constexpr float PacketRateSampleSeconds = 1.0f;
+constexpr double PacketRateRestartGapSeconds = 2.0;
 constexpr float PacketSilenceTimeoutSeconds = 0.5f;
 constexpr float DelayedPacketRateThreshold = 20.0f;
 constexpr float GuidanceSuccessDisplaySeconds = 2.0f;
@@ -176,16 +178,22 @@ void UVPTrackingDashboard::NativeTick(const FGeometry& MyGeometry, float InDelta
 		}
 	}
 	if (BroadcastOutput &&
-		ObservedObsFPSNoticeRevision != BroadcastOutput->GetObsFPSNoticeRevision() &&
+		ObservedInputCameraListRevision != BroadcastOutput->GetInputCameraListRevision())
+	{
+		ObservedInputCameraListRevision = BroadcastOutput->GetInputCameraListRevision();
+		RefreshInputCameraSelector();
+	}
+	if (BroadcastOutput &&
+		ObservedInputCameraNoticeRevision != BroadcastOutput->GetInputCameraNoticeRevision() &&
 		!IsModalOpen())
 	{
-		ObservedObsFPSNoticeRevision = BroadcastOutput->GetObsFPSNoticeRevision();
-		if (!BroadcastOutput->GetObsFPSNoticeText().IsEmpty())
+		ObservedInputCameraNoticeRevision = BroadcastOutput->GetInputCameraNoticeRevision();
+		if (!BroadcastOutput->GetInputCameraNoticeText().IsEmpty())
 		{
 			ShowNoticeModal(
-				BroadcastOutput->GetObsFPSNoticeText(),
-				false,
-				TEXT("OBS 출력 중"));
+				BroadcastOutput->GetInputCameraNoticeText(),
+				BroadcastOutput->IsInputCameraNoticeError(),
+				TEXT("입력 카메라"));
 		}
 	}
 
@@ -195,7 +203,7 @@ void UVPTrackingDashboard::NativeTick(const FGeometry& MyGeometry, float InDelta
 		TargetSearchElapsedSeconds = 0.0f;
 		FindTrackingTargets();
 	}
-	UpdatePacketRate(InDeltaTime);
+	UpdatePacketRate();
 	UpdateGuidanceVisibility(InDeltaTime);
 	UpdateBackgroundColorCommit(InDeltaTime);
 	UpdateAvatarExposureCommit(InDeltaTime);
@@ -232,12 +240,15 @@ FReply UVPTrackingDashboard::NativeOnMouseButtonDown(
 		return Super::NativeOnMouseButtonDown(InGeometry, InMouseEvent);
 	}
 
-	if (InMouseEvent.GetEffectingButton() == EKeys::LeftMouseButton &&
+	const FKey EffectingButton = InMouseEvent.GetEffectingButton();
+	if ((EffectingButton == EKeys::LeftMouseButton ||
+		EffectingButton == EKeys::RightMouseButton) &&
 		BroadcastOutput &&
 		BroadcastOutput->IsAvatarCaptureReady() &&
 		IsAvatarPreviewArea(InGeometry, InMouseEvent))
 	{
-		bPanningCamera = true;
+		bPanningCamera = EffectingButton == EKeys::LeftMouseButton;
+		bOrbitingCamera = EffectingButton == EKeys::RightMouseButton;
 		LastCameraPointerPosition = InMouseEvent.GetScreenSpacePosition();
 		return FReply::Handled().CaptureMouse(TakeWidget());
 	}
@@ -254,6 +265,11 @@ FReply UVPTrackingDashboard::NativeOnMouseButtonUp(
 		bPanningCamera = false;
 		return FReply::Handled().ReleaseMouseCapture();
 	}
+	if (bOrbitingCamera && InMouseEvent.GetEffectingButton() == EKeys::RightMouseButton)
+	{
+		bOrbitingCamera = false;
+		return FReply::Handled().ReleaseMouseCapture();
+	}
 
 	return Super::NativeOnMouseButtonUp(InGeometry, InMouseEvent);
 }
@@ -266,6 +282,13 @@ FReply UVPTrackingDashboard::NativeOnMouseMove(
 	{
 		const FVector2D CurrentPosition = InMouseEvent.GetScreenSpacePosition();
 		BroadcastOutput->PanCamera(CurrentPosition - LastCameraPointerPosition);
+		LastCameraPointerPosition = CurrentPosition;
+		return FReply::Handled();
+	}
+	if (bOrbitingCamera && BroadcastOutput)
+	{
+		const FVector2D CurrentPosition = InMouseEvent.GetScreenSpacePosition();
+		BroadcastOutput->OrbitCamera(CurrentPosition - LastCameraPointerPosition);
 		LastCameraPointerPosition = CurrentPosition;
 		return FReply::Handled();
 	}
@@ -296,6 +319,7 @@ FReply UVPTrackingDashboard::NativeOnMouseWheel(
 void UVPTrackingDashboard::NativeOnMouseCaptureLost(const FCaptureLostEvent& CaptureLostEvent)
 {
 	bPanningCamera = false;
+	bOrbitingCamera = false;
 	Super::NativeOnMouseCaptureLost(CaptureLostEvent);
 }
 
@@ -590,10 +614,10 @@ void UVPTrackingDashboard::BuildLayout()
 	DeleteAvatarButton->OnClicked.AddDynamic(this, &UVPTrackingDashboard::HandleDeleteAvatarClicked);
 	UTextBlock* ResetCameraLabel = nullptr;
 	UButton* ResetCameraButton = CreateButton(
-		ControlPanel, TEXT("카메라 전신 자동 맞춤"), ResetCameraLabel, SecondaryButtonColor);
+		ControlPanel, TEXT("카메라 정면 전신 맞춤"), ResetCameraLabel, SecondaryButtonColor);
 	ResetCameraButton->OnClicked.AddDynamic(this, &UVPTrackingDashboard::HandleResetCameraClicked);
 	UTextBlock* CameraHelp = CreateText(
-		TEXT("중앙 화면 드래그: 이동 · 휠: 확대/축소 · 위치는 아바타별 자동 저장"),
+		TEXT("좌 드래그: 이동 · 우 드래그: 회전 · 휠: 확대/축소\n위치와 방향은 아바타별 자동 저장"),
 		11,
 		MutedTextColor);
 	ControlPanel->AddChildToVerticalBox(CameraHelp)->SetPadding(FMargin(0.0f, 0.0f, 0.0f, 7.0f));
@@ -610,7 +634,7 @@ void UVPTrackingDashboard::BuildLayout()
 	BackgroundModeButton->OnClicked.AddDynamic(
 		this, &UVPTrackingDashboard::HandleBackgroundModeClicked);
 	BackgroundColorUsageText = CreateText(
-		TEXT("미리보기 배경색 · OBS에는 아바타만 송출"),
+		TEXT("미리보기 배경색 · Spout는 아바타만 송신"),
 		11,
 		MutedTextColor);
 	ControlPanel->AddChildToVerticalBox(BackgroundColorUsageText)->SetPadding(
@@ -727,7 +751,7 @@ void UVPTrackingDashboard::BuildLayout()
 	OutputFPSSlider->SetSliderBarColor(AccentColor.CopyWithNewOpacity(0.7f));
 	OutputFPSSlider->SetSliderHandleColor(AccentColor);
 	OutputFPSSlider->SetToolTipText(FText::FromString(
-		TEXT("앱과 Spout의 FPS를 조절합니다. OBS가 출력 중이 아니면 OBS FPS도 함께 변경합니다.")));
+		TEXT("앱 화면, SceneCapture와 Spout 송출 프레임률을 함께 조절합니다.")));
 	UHorizontalBoxSlot* OutputFPSSliderSlot =
 		OutputFPSRow->AddChildToHorizontalBox(OutputFPSSlider);
 	OutputFPSSliderSlot->SetSize(FSlateChildSize(ESlateSizeRule::Fill));
@@ -741,9 +765,38 @@ void UVPTrackingDashboard::BuildLayout()
 	OutputFPSValueSize->AddChild(OutputFPSValueText);
 	OutputFPSSlider->OnValueChanged.AddDynamic(
 		this, &UVPTrackingDashboard::HandleOutputFPSChanged);
-	ObsFPSStatusText = CreateText(TEXT("OBS FPS 확인 대기"), 11, MutedTextColor);
-	ControlPanel->AddChildToVerticalBox(ObsFPSStatusText)->SetPadding(
-		FMargin(82.0f, 0.0f, 0.0f, 3.0f));
+	UTextBlock* InputCameraSection = CreateText(TEXT("입력 카메라"), 16, AccentColor);
+	TrackingSettingsPanel->AddChildToVerticalBox(InputCameraSection)->SetPadding(
+		FMargin(0.0f, 2.0f, 0.0f, 2.0f));
+	InputCameraStatusText = CreateText(TEXT("입력 카메라 확인 중"), 12, MutedTextColor);
+	TrackingSettingsPanel->AddChildToVerticalBox(InputCameraStatusText)->SetPadding(
+		FMargin(0.0f, 0.0f, 0.0f, 3.0f));
+	USizeBox* InputCameraRowSize = WidgetTree->ConstructWidget<USizeBox>();
+	InputCameraRowSize->SetHeightOverride(38.0f);
+	TrackingSettingsPanel->AddChildToVerticalBox(InputCameraRowSize)->SetPadding(
+		FMargin(0.0f, 1.0f, 0.0f, 8.0f));
+	UHorizontalBox* InputCameraRow = WidgetTree->ConstructWidget<UHorizontalBox>();
+	InputCameraRowSize->AddChild(InputCameraRow);
+	InputCameraSelector = WidgetTree->ConstructWidget<UComboBoxString>();
+	InputCameraSelector->SetToolTipText(FText::FromString(
+		TEXT("얼굴과 상완 추적에 사용할 웹캠을 선택합니다.")));
+	InputCameraSelector->OnSelectionChanged.AddDynamic(
+		this, &UVPTrackingDashboard::HandleInputCameraSelectionChanged);
+	UHorizontalBoxSlot* InputCameraSelectorSlot =
+		InputCameraRow->AddChildToHorizontalBox(InputCameraSelector);
+	InputCameraSelectorSlot->SetSize(FSlateChildSize(ESlateSizeRule::Fill));
+	InputCameraSelectorSlot->SetPadding(FMargin(2.0f));
+	InputCameraSelectorSlot->SetVerticalAlignment(VAlign_Fill);
+	UTextBlock* RefreshInputCamerasLabel = nullptr;
+	UButton* RefreshInputCamerasButton = CreateInlineButton(
+		InputCameraRow,
+		TEXT("새로고침"),
+		SecondaryButtonColor,
+		RefreshInputCamerasLabel);
+	CastChecked<UHorizontalBoxSlot>(RefreshInputCamerasButton->Slot)->SetSize(
+		FSlateChildSize(ESlateSizeRule::Automatic));
+	RefreshInputCamerasButton->OnClicked.AddDynamic(
+		this, &UVPTrackingDashboard::HandleRefreshInputCamerasClicked);
 
 	UTextBlock* CalibrationSection = CreateText(TEXT("1. 중립 자세 캘리브레이션"), 16, AccentColor);
 	TrackingSettingsPanel->AddChildToVerticalBox(CalibrationSection)->SetPadding(FMargin(0.0f, 2.0f, 0.0f, 2.0f));
@@ -1013,6 +1066,40 @@ void UVPTrackingDashboard::RefreshAvatarSelector()
 	ObservedAvatarLibraryRevision = AvatarManager->GetLibraryRevision();
 }
 
+void UVPTrackingDashboard::RefreshInputCameraSelector()
+{
+	if (!InputCameraSelector || !BroadcastOutput)
+	{
+		return;
+	}
+
+	InputCameraOptionToId.Reset();
+	InputCameraSelector->ClearOptions();
+	FString SelectedOption;
+	for (const FVPInputCameraDevice& Device : BroadcastOutput->GetInputCameraDevices())
+	{
+		const FString Option = Device.bIsVirtual
+			? FString::Printf(TEXT("%s · 가상"), *Device.DisplayName)
+			: Device.DisplayName;
+		InputCameraOptionToId.Add(Option, Device.Id);
+		InputCameraSelector->AddOption(Option);
+		if (Device.Id == BroadcastOutput->GetActiveInputCameraId())
+		{
+			SelectedOption = Option;
+		}
+	}
+
+	InputCameraSelector->SetIsEnabled(!InputCameraOptionToId.IsEmpty());
+	if (SelectedOption.IsEmpty())
+	{
+		InputCameraSelector->ClearSelection();
+	}
+	else
+	{
+		InputCameraSelector->SetSelectedOption(SelectedOption);
+	}
+}
+
 FText UVPTrackingDashboard::BuildGuidanceText(
 	EVPCalibrationState CalibrationState,
 	EVPArmValidationStage ValidationStage,
@@ -1083,8 +1170,8 @@ FText UVPTrackingDashboard::BuildTrackingStatusText(
 		{
 			const int32 RoundedRate = FMath::Max(0, FMath::RoundToInt(PacketsPerSecond));
 			DataStatus = PacketsPerSecond >= DelayedPacketRateThreshold
-				? FString::Printf(TEXT("데이터 정상 %dfps"), RoundedRate)
-				: FString::Printf(TEXT("데이터 지연 %dfps"), RoundedRate);
+				? FString::Printf(TEXT("트래킹 입력 정상 · %d회/초"), RoundedRate)
+				: FString::Printf(TEXT("트래킹 입력 지연 · %d회/초"), RoundedRate);
 		}
 	}
 
@@ -1097,13 +1184,31 @@ FText UVPTrackingDashboard::BuildTrackingStatusText(
 		bRightArmTracked ? TEXT("추적") : TEXT("중립")));
 }
 
-void UVPTrackingDashboard::UpdatePacketRate(float DeltaSeconds)
+float UVPTrackingDashboard::CalculatePacketRate(int32 PacketDelta, double ElapsedSeconds)
 {
+	if (PacketDelta <= 0 || !FMath::IsFinite(ElapsedSeconds) || ElapsedSeconds <= 0.0)
+	{
+		return 0.0f;
+	}
+	return static_cast<float>(static_cast<double>(PacketDelta) / ElapsedSeconds);
+}
+
+bool UVPTrackingDashboard::ShouldRestartPacketRateSample(double UpdateGapSeconds)
+{
+	return !FMath::IsFinite(UpdateGapSeconds) || UpdateGapSeconds < 0.0 ||
+		UpdateGapSeconds >= PacketRateRestartGapSeconds;
+}
+
+void UVPTrackingDashboard::UpdatePacketRate()
+{
+	const double NowSeconds = FPlatformTime::Seconds();
 	if (!Receiver)
 	{
-		PacketRateWindowElapsedSeconds = 0.0f;
 		SecondsSinceLastPacket = 0.0f;
 		DisplayedPacketRate = 0.0f;
+		PacketRateWindowStartTimeSeconds = 0.0;
+		LastPacketRateUpdateTimeSeconds = 0.0;
+		LastPacketObservedTimeSeconds = 0.0;
 		LastObservedPacketCount = INDEX_NONE;
 		PacketRateWindowStartCount = 0;
 		bPacketRateReady = false;
@@ -1115,29 +1220,56 @@ void UVPTrackingDashboard::UpdatePacketRate(float DeltaSeconds)
 	{
 		LastObservedPacketCount = CurrentPacketCount;
 		PacketRateWindowStartCount = CurrentPacketCount;
-		PacketRateWindowElapsedSeconds = 0.0f;
+		PacketRateWindowStartTimeSeconds = NowSeconds;
+		LastPacketRateUpdateTimeSeconds = NowSeconds;
+		LastPacketObservedTimeSeconds = NowSeconds;
 		SecondsSinceLastPacket = 0.0f;
 		DisplayedPacketRate = 0.0f;
 		bPacketRateReady = false;
 		return;
 	}
 
-	const float SafeDeltaSeconds = FMath::Max(0.0f, DeltaSeconds);
-	SecondsSinceLastPacket = CurrentPacketCount > LastObservedPacketCount
-		? 0.0f
-		: SecondsSinceLastPacket + SafeDeltaSeconds;
-	PacketRateWindowElapsedSeconds += SafeDeltaSeconds;
-
-	if (PacketRateWindowElapsedSeconds >= PacketRateSampleSeconds)
+	const bool bReceivedSinceLastUpdate = CurrentPacketCount > LastObservedPacketCount;
+	const double UpdateGapSeconds = NowSeconds - LastPacketRateUpdateTimeSeconds;
+	if (ShouldRestartPacketRateSample(UpdateGapSeconds))
 	{
-		DisplayedPacketRate = static_cast<float>(CurrentPacketCount - PacketRateWindowStartCount) /
-			PacketRateWindowElapsedSeconds;
+		if (bReceivedSinceLastUpdate)
+		{
+			LastPacketObservedTimeSeconds = NowSeconds;
+			bPacketRateReady = false;
+			DisplayedPacketRate = 0.0f;
+		}
+		SecondsSinceLastPacket = static_cast<float>(FMath::Max(
+			0.0,
+			NowSeconds - LastPacketObservedTimeSeconds));
 		PacketRateWindowStartCount = CurrentPacketCount;
-		PacketRateWindowElapsedSeconds = 0.0f;
+		PacketRateWindowStartTimeSeconds = NowSeconds;
+		LastObservedPacketCount = CurrentPacketCount;
+		LastPacketRateUpdateTimeSeconds = NowSeconds;
+		return;
+	}
+
+	if (bReceivedSinceLastUpdate)
+	{
+		LastPacketObservedTimeSeconds = NowSeconds;
+	}
+	SecondsSinceLastPacket = static_cast<float>(FMath::Max(
+		0.0,
+		NowSeconds - LastPacketObservedTimeSeconds));
+	const double SampleElapsedSeconds = NowSeconds - PacketRateWindowStartTimeSeconds;
+
+	if (SampleElapsedSeconds >= PacketRateSampleSeconds)
+	{
+		DisplayedPacketRate = CalculatePacketRate(
+			CurrentPacketCount - PacketRateWindowStartCount,
+			SampleElapsedSeconds);
+		PacketRateWindowStartCount = CurrentPacketCount;
+		PacketRateWindowStartTimeSeconds = NowSeconds;
 		bPacketRateReady = true;
 	}
 
 	LastObservedPacketCount = CurrentPacketCount;
+	LastPacketRateUpdateTimeSeconds = NowSeconds;
 }
 
 void UVPTrackingDashboard::UpdateGuidanceVisibility(float DeltaSeconds)
@@ -1403,8 +1535,8 @@ void UVPTrackingDashboard::RefreshDashboard()
 		{
 			BackgroundColorUsageText->SetText(FText::FromString(
 				bBackgroundRemoved
-					? TEXT("미리보기 배경색 · OBS에는 아바타만 송출")
-					: TEXT("송출 배경색 · OBS에 아바타와 함께 송출")));
+					? TEXT("미리보기 배경색 · Spout는 아바타만 송신")
+					: TEXT("송출 배경색 · Spout에 아바타와 함께 송신")));
 		}
 		if (BackgroundColorSwatch)
 		{
@@ -1413,14 +1545,21 @@ void UVPTrackingDashboard::RefreshDashboard()
 		RefreshBackgroundColorControls(BroadcastOutput->GetBackgroundColor());
 		RefreshAvatarExposureControl(BroadcastOutput->GetAvatarExposureStops());
 		RefreshOutputFPSControl(BroadcastOutput->GetOutputFPS());
-		if (ObsFPSStatusText)
-		{
-			ObsFPSStatusText->SetText(FText::FromString(BroadcastOutput->GetObsFPSStatusText()));
-		}
 	}
 	else if (BroadcastStatusText)
 	{
 		BroadcastStatusText->SetText(FText::FromString(TEXT("방송 출력 연결 대기")));
+	}
+	if (InputCameraStatusText)
+	{
+		InputCameraStatusText->SetText(FText::FromString(
+			BroadcastOutput
+				? BroadcastOutput->GetInputCameraStatusText()
+				: TEXT("입력 카메라 연결 대기")));
+		InputCameraStatusText->SetColorAndOpacity(FSlateColor(
+			BroadcastOutput && BroadcastOutput->HasActiveInputCamera()
+				? MutedTextColor
+				: TrackingLostColor));
 	}
 
 	if (PoseStatusText)
@@ -1715,6 +1854,28 @@ void UVPTrackingDashboard::HandleOutputFPSChanged(float Value)
 	RefreshOutputFPSControl(BroadcastOutput->GetOutputFPS());
 	bOutputFPSCommitPending = true;
 	OutputFPSCommitRemainingSeconds = OutputFPSCommitDelaySeconds;
+}
+
+void UVPTrackingDashboard::HandleInputCameraSelectionChanged(
+	FString SelectedItem,
+	ESelectInfo::Type SelectionType)
+{
+	if (!BroadcastOutput || SelectionType == ESelectInfo::Direct)
+	{
+		return;
+	}
+	if (const FString* DeviceId = InputCameraOptionToId.Find(SelectedItem))
+	{
+		BroadcastOutput->SelectInputCamera(*DeviceId);
+	}
+}
+
+void UVPTrackingDashboard::HandleRefreshInputCamerasClicked()
+{
+	if (BroadcastOutput)
+	{
+		BroadcastOutput->RequestInputCameraList();
+	}
 }
 
 void UVPTrackingDashboard::HandleAddAvatarClicked()

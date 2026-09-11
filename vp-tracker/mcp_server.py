@@ -2,7 +2,6 @@
 import socket
 import os
 from mcp.server.fastmcp import FastMCP
-from obs_controller import _load_password
 from protocol import (
     BLENDSHAPE_COUNT,
     EXPECTED_PACKET_SIZE,
@@ -54,22 +53,6 @@ def check_webcam() -> dict:
             cap.release()
 
 @mcp.tool()
-def check_obs_connection(port: int = 4455) -> dict:
-    """OBS WebSocket 연결 상태를 확인한다. 비밀번호는 환경/.env에서만 읽는다."""
-    try:
-        import obsws_python as obs
-        client = obs.ReqClient(host="localhost", port=port, password=_load_password(), timeout=3)
-        ver = client.get_version()
-        client.disconnect()
-        return {"status": "ok", "version": ver.obs_version, "port": port}
-    except ImportError:
-        return {"status": "error", "message": "obsws-python not installed"}
-    except ConnectionRefusedError:
-        return {"status": "warning", "message": "OBS not running or WebSocket disabled"}
-    except Exception as e:
-        return {"status": "warning", "message": f"OBS connection failed: {type(e).__name__}"}
-
-@mcp.tool()
 def check_mediapipe_models() -> dict:
     """MediaPipe Task 모델 파일 존재 여부 확인"""
     from tracker import POSE_MODEL_FILES, selected_pose_model
@@ -108,7 +91,6 @@ def run_pipeline_diagnostics() -> dict:
     return {
         "webcam": check_webcam(),
         "unreal_udp": check_udp_listener(7000),
-        "obs": check_obs_connection(4455),
         "models": check_mediapipe_models(),
         "protocol": get_tracking_protocol(),
     }

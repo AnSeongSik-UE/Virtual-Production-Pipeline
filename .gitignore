@@ -104,6 +104,12 @@ __pycache__/
 *.py[cod]
 .venv/
 *.egg-info/
+vp-tracker/build/
+vp-tracker/dist/
 
 # MediaPipe model files (large binary)
 vp-tracker/models/*.task
+
+# Third-party runtime model binaries stay local unless redistribution rights
+# have been verified. Their .meta files remain tracked to preserve references.
+/LocalOnly/

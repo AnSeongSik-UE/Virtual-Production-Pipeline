@@ -11,7 +11,6 @@ import socket
 import subprocess
 import sys
 import threading
-import time
 
 from lifecycle import (
     WindowsJob,
@@ -27,7 +26,6 @@ DEFAULT_UNREAL_EDITOR = Path(
 )
 INSTANCE_MUTEX_NAME = r"Local\VirtualProductionPipeline.Supervisor"
 WINDOWS_STATUS_CONTROL_C_EXIT = 0xC000013A
-STREAM_CONFIRM_TIMEOUT_SECONDS = 10.0
 RUNTIME_DISABLED_PLUGINS = (
     "ModelContextProtocol",
     "EditorToolset",
@@ -49,8 +47,17 @@ class PipelineSupervisor:
         unreal_executable: Path | None = None,
         project_path: Path | None = None,
         map_path: str = "/Game/Maps/Lvl_Empty",
+        packaged_mode: bool = False,
+        interactive_commands: bool = True,
     ):
         self.base_dir = Path(__file__).resolve().parent
+        self.packaged_mode = packaged_mode
+        self.interactive_commands = interactive_commands
+        self.distribution_dir = (
+            Path(sys.executable).resolve().parent
+            if packaged_mode
+            else self.base_dir.parent
+        )
         self.project_path = (
             project_path
             or self.base_dir.parent / "VPPipeline" / "VPPipeline.uproject"
@@ -58,28 +65,38 @@ class PipelineSupervisor:
         configured_editor = os.getenv("VP_UNREAL_EDITOR", "").strip()
         self.unreal_executable = (
             unreal_executable
+            or (
+                self.distribution_dir / "Runtime" / "VPPipeline.exe"
+                if packaged_mode
+                else None
+            )
             or (Path(configured_editor) if configured_editor else DEFAULT_UNREAL_EDITOR)
         ).resolve()
         self.map_path = map_path
         self.processes: dict[str, subprocess.Popen] = {}
-        self.obs_ctrl = None
         self.session_token = secrets.token_hex(16)
         self.job = WindowsJob()
         self._command_queue: Queue[str | None] = Queue()
         self._shutdown_started = False
-        self._stream_confirmation_deadline: float | None = None
 
     def preflight_check(self) -> bool:
-        """Check resources without retaining the webcam or OBS connection."""
+        """Check required resources without retaining the webcam."""
         print("[Preflight]")
         checks = [
             ("Webcam", self._check_webcam(), True),
             ("MediaPipe models", self._check_models(), True),
-            ("Unreal Editor", self._check_file(self.unreal_executable), True),
-            ("Unreal project", self._check_file(self.project_path), True),
+            (
+                "Unreal application" if self.packaged_mode else "Unreal Editor",
+                self._check_file(self.unreal_executable),
+                True,
+            ),
             ("Tracking ports", self._check_pipeline_ports(), True),
-            ("OBS WebSocket", self._check_obs(), False),
         ]
+        if not self.packaged_mode:
+            checks.insert(
+                3,
+                ("Unreal project", self._check_file(self.project_path), True),
+            )
 
         all_ok = True
         for name, (ok, message), required in checks:
@@ -102,8 +119,8 @@ class PipelineSupervisor:
             self.job.open()
             self._launch_unreal()
             self._launch_tracker()
-            self._connect_obs()
-            self._start_command_reader()
+            if self.interactive_commands:
+                self._start_command_reader()
             self._print_ready()
             return self._monitor_loop()
         except KeyboardInterrupt:
@@ -120,7 +137,11 @@ class PipelineSupervisor:
         print("\n[UE] Launching managed Unreal session...")
         process = subprocess.Popen(
             command,
-            cwd=self.project_path.parent,
+            cwd=(
+                self.unreal_executable.parent
+                if self.packaged_mode
+                else self.project_path.parent
+            ),
             creationflags=_new_process_group_flags(),
         )
         self.processes["unreal"] = process
@@ -128,6 +149,16 @@ class PipelineSupervisor:
         print(f"[UE] Unreal running (PID: {process.pid})")
 
     def _build_unreal_command(self) -> list[str]:
+        if self.packaged_mode:
+            return [
+                str(self.unreal_executable),
+                self.map_path,
+                "-windowed",
+                "-ResX=1280",
+                "-ResY=720",
+                "-SaveToUserDir",
+                f"-VPSessionToken={self.session_token}",
+            ]
         return [
             str(self.unreal_executable),
             str(self.project_path),
@@ -145,31 +176,22 @@ class PipelineSupervisor:
         environment = os.environ.copy()
         environment["VP_SESSION_TOKEN"] = self.session_token
         print("\n[TRACK] Launching managed tracker...")
+        command = (
+            [sys.executable, "--tracker-child"]
+            if self.packaged_mode
+            else [sys.executable, "sender.py"]
+        )
         process = subprocess.Popen(
-            [sys.executable, "sender.py"],
+            command,
             cwd=self.base_dir,
             env=environment,
-            creationflags=_new_process_group_flags(),
+            creationflags=_new_process_group_flags(
+                hide_window=self.packaged_mode,
+            ),
         )
         self.processes["tracker"] = process
         self.job.assign(process)
         print(f"[TRACK] Tracker waiting for Unreal heartbeat (PID: {process.pid})")
-
-    def _connect_obs(self) -> None:
-        print("\n[OBS] Connecting...")
-        try:
-            from obs_controller import OBSController, is_obs_websocket_available
-
-            if not is_obs_websocket_available():
-                print("[OBS] Connection unavailable: OBS is not running")
-                print("[OBS] Continuing without OBS control")
-                return
-            self.obs_ctrl = OBSController()
-            print(f"[OBS] Current scene: {self.obs_ctrl.get_current_scene()}")
-        except Exception as exc:
-            print(f"[OBS] Connection unavailable: {exc}")
-            print("[OBS] Continuing without OBS control")
-            self.obs_ctrl = None
 
     def _start_command_reader(self) -> None:
         def read_commands() -> None:
@@ -222,98 +244,19 @@ class PipelineSupervisor:
                 print(f"[WARN] Command failed: {type(exc).__name__}: {exc}")
 
     def _handle_command(self, command: str) -> None:
-        if command == "stream":
-            if not self.obs_ctrl:
-                print("[OBS] Not connected")
-                return
-            status = self.obs_ctrl.get_output_status()
-            if status.stream_active:
-                self._stream_confirmation_deadline = None
-                print("[OBS] Streaming is already active")
-                self._print_obs_status(status)
-                return
-            self._stream_confirmation_deadline = (
-                time.monotonic() + STREAM_CONFIRM_TIMEOUT_SECONDS
-            )
-            print(
-                "[CONFIRM] Live streaming is armed. Type 'stream confirm' "
-                f"within {STREAM_CONFIRM_TIMEOUT_SECONDS:.0f} seconds to start."
-            )
-        elif command == "stream confirm":
-            if not self.obs_ctrl:
-                print("[OBS] Not connected")
-                return
-            deadline = self._stream_confirmation_deadline
-            self._stream_confirmation_deadline = None
-            if deadline is None:
-                print("[OBS] Streaming was not armed. Type 'stream' first.")
-                return
-            if time.monotonic() > deadline:
-                print("[OBS] Streaming confirmation expired. Type 'stream' again.")
-                return
-            self.obs_ctrl.start_streaming()
-            self._print_obs_status()
-        elif command == "stop":
-            self._stream_confirmation_deadline = None
-            if self.obs_ctrl:
-                self.obs_ctrl.stop_streaming()
-                self._print_obs_status()
-            else:
-                print("[OBS] Not connected")
-        elif command == "rec":
-            if self.obs_ctrl:
-                self.obs_ctrl.start_recording()
-                self._print_obs_status()
-            else:
-                print("[OBS] Not connected")
-        elif command == "stoprec":
-            if self.obs_ctrl:
-                self.obs_ctrl.stop_recording()
-                self._print_obs_status()
-            else:
-                print("[OBS] Not connected")
-        elif command == "status":
+        if command == "status":
             self._print_status()
         else:
-            print(
-                "Unknown command. Try: stream, stream confirm, stop, rec, "
-                "stoprec, status, quit"
-            )
+            print("Unknown command. Try: status, quit")
 
     def _print_ready(self) -> None:
         print("\n" + "=" * 58)
         print("  Pipeline managed session started")
         print("=" * 58)
         print("  Closing Unreal also stops tracking and releases the webcam.")
-        print("  Commands: stream, stream confirm, stop, rec, stoprec, status, quit")
-        print("  Live streaming requires 'stream' followed by confirmation within 10s.")
+        if self.interactive_commands:
+            print("  Commands: status, quit")
         print()
-
-    def _print_obs_status(self, status=None) -> None:
-        if not self.obs_ctrl:
-            print("  [--] OBS: not connected")
-            return
-        status = status or self.obs_ctrl.get_output_status()
-        print("  [OK] OBS: connected")
-        if status.stream_active:
-            print(
-                "  [LIVE] Streaming: "
-                f"{_format_duration(status.stream_duration_ms)}, "
-                f"{_format_bytes(status.stream_bytes)}"
-            )
-        else:
-            print("  [--] Streaming: inactive")
-        if status.record_active:
-            paused = " (paused)" if status.record_paused else ""
-            print(
-                f"  [REC] Recording{paused}: "
-                f"{_format_duration(status.record_duration_ms)}, "
-                f"{_format_bytes(status.record_bytes)}"
-            )
-            if status.record_path:
-                print(f"        Path: {status.record_path}")
-        else:
-            print("  [--] Recording: inactive")
 
     def _print_status(self) -> None:
         print("\n--- Pipeline Status ---")
@@ -325,13 +268,6 @@ class PipelineSupervisor:
                 code = process.returncode if process else "not started"
                 print(f"  [FAIL] {name}: not running (exit={code})")
 
-        if self.obs_ctrl:
-            try:
-                self._print_obs_status()
-            except Exception:
-                print("  [FAIL] OBS: connection lost")
-        else:
-            print("  [--] OBS: not connected")
         print()
 
     def _shutdown(self) -> None:
@@ -371,20 +307,6 @@ class PipelineSupervisor:
                 except Exception as exc:
                     print(f"  [unreal] cleanup error: {exc}")
 
-            if self.obs_ctrl:
-                try:
-                    status = self.obs_ctrl.get_output_status()
-                    if status.stream_active:
-                        print("  [OBS] Streaming remains active; OBS is externally owned")
-                    if status.record_active:
-                        print("  [OBS] Recording remains active; OBS is externally owned")
-                except Exception:
-                    pass
-                try:
-                    self.obs_ctrl.disconnect()
-                except Exception:
-                    pass
-                self.obs_ctrl = None
         finally:
             self.job.close()
         print("[*] Pipeline stopped; managed webcam ownership released")
@@ -397,10 +319,25 @@ class PipelineSupervisor:
         capture = None
         try:
             import cv2
+            from camera_devices import (
+                choose_startup_camera,
+                enumerate_camera_devices,
+                load_selected_camera_id,
+            )
 
-            capture = cv2.VideoCapture(0)
+            devices = enumerate_camera_devices()
+            selected, _ = choose_startup_camera(
+                devices,
+                load_selected_camera_id(),
+            )
+            if selected is None:
+                return (False, "No camera device found")
+            capture = cv2.VideoCapture(selected.index, selected.backend)
             ok = capture.isOpened()
-            return (ok, "Available" if ok else "Not found or already in use")
+            return (
+                ok,
+                selected.display_name if ok else f"{selected.display_name} is already in use",
+            )
         except ImportError:
             return (False, "OpenCV not installed")
         except Exception as exc:
@@ -421,20 +358,6 @@ class PipelineSupervisor:
             return (False, f"Already in use: {', '.join(occupied)}")
         return (True, "7000 and 7001 available")
 
-    def _check_obs(self) -> tuple[bool, str]:
-        try:
-            from obs_controller import OBSController, is_obs_websocket_available
-
-            if not is_obs_websocket_available():
-                return (False, "OBS not running or WebSocket disabled")
-            controller = OBSController()
-            controller.disconnect()
-            return (True, "Connected")
-        except ConnectionRefusedError:
-            return (False, "OBS not running or WebSocket disabled")
-        except Exception as exc:
-            return (False, str(exc))
-
     def _check_models(self) -> tuple[bool, str]:
         from tracker import POSE_MODEL_FILES, selected_pose_model
 
@@ -447,19 +370,13 @@ class PipelineSupervisor:
         return (False, f"Missing: {', '.join(missing)}")
 
 
-def _format_duration(milliseconds: int) -> str:
-    total_seconds = max(0, int(milliseconds)) // 1000
-    hours, remainder = divmod(total_seconds, 3600)
-    minutes, seconds = divmod(remainder, 60)
-    return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
-
-
-def _format_bytes(byte_count: int) -> str:
-    return f"{max(0, int(byte_count)) / (1024 * 1024):.1f} MiB"
-
-
-def _new_process_group_flags() -> int:
-    return subprocess.CREATE_NEW_PROCESS_GROUP if sys.platform == "win32" else 0
+def _new_process_group_flags(*, hide_window: bool = False) -> int:
+    if sys.platform != "win32":
+        return 0
+    flags = subprocess.CREATE_NEW_PROCESS_GROUP
+    if hide_window:
+        flags |= subprocess.CREATE_NO_WINDOW
+    return flags
 
 
 def parse_args() -> argparse.Namespace:
@@ -470,7 +387,7 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def main() -> int:
+def main(*, packaged_mode: bool = False, interactive_commands: bool = True) -> int:
     arguments = parse_args()
     instance = WindowsSingleInstance(INSTANCE_MUTEX_NAME)
     if not instance.acquire():
@@ -481,6 +398,8 @@ def main() -> int:
             unreal_executable=arguments.unreal_exe,
             project_path=arguments.project,
             map_path=arguments.map,
+            packaged_mode=packaged_mode,
+            interactive_commands=interactive_commands,
         ).launch()
     finally:
         instance.close()
